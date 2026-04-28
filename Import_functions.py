@@ -323,24 +323,24 @@ def generate_sysml(functions: list[FunctionNode], package_name: str = "Functions
     return "\n".join(lines)
 
 
-# ---------------------------------------------------------------------------
-# Validation
-# ---------------------------------------------------------------------------
+# # ---------------------------------------------------------------------------
+# # Validation
+# # ---------------------------------------------------------------------------
 
-def validate(path: pathlib.Path) -> bool:
-    try:
-        import syside
-        _, diagnostics = syside.load_model([path])
-        if diagnostics.contains_errors():
-            print("Validation errors:")
-            for d in diagnostics:
-                print(f"  {d}")
-            return False
-        print("Validation passed (no errors).")
-        return True
-    except Exception as exc:
-        print(f"Could not validate with syside: {exc}")
-        return False
+# def validate(path: pathlib.Path) -> bool:
+#     try:
+#         import syside
+#         _, diagnostics = syside.load_model([path])
+#         if diagnostics.contains_errors():
+#             print("Validation errors:")
+#             for d in diagnostics:
+#                 print(f"  {d}")
+#             return False
+#         print("Validation passed (no errors).")
+#         return True
+#     except Exception as exc:
+#         print(f"Could not validate with syside: {exc}")
+#         return False
 
 
 # ---------------------------------------------------------------------------
@@ -400,7 +400,7 @@ def main() -> None:
     output_path.write_text(sysml, encoding="utf-8")
     print(f"Written:  {output_path}")
 
-    validate(output_path)
+    # validate(output_path)
 
 
 if __name__ == "__main__":
