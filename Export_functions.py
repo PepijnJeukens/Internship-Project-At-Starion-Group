@@ -2,83 +2,30 @@
 """
 export_functions_to_excel.py
 Exports functions from a SysML v2 file to an Excel file with hierarchical structure.
-Function names are converted from PascalCase to space-separated words.
-
-Expected output format:
-- Row 1: Headers (Function ID, Function Name, Function Kind, SubFunction ID, etc.)
-- Row 2: Function (only Function columns filled with space-separated name)
-- Row 3: SubFunction (only SubFunction columns filled with space-separated name)
-- etc.
-
-Each row contains exactly one level of the hierarchy with all higher levels blank.
+Uses text parsing to avoid syside import issues.
+Each function is exported only once at its correct hierarchy level.
 """
 
 import pathlib
 import re
 import sys
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List
 
-import syside
 import openpyxl
 from openpyxl.styles import PatternFill
 
-try:
-    import openpyxl
-except ImportError:
-    print("Error: openpyxl is required. Install it with: pip install openpyxl", file=sys.stderr)
-    sys.exit(1)
-
-# ---------------------------------------------------------------------------
-# Helper functions
-# ---------------------------------------------------------------------------
-
-def get_element_id(element: syside.Element) -> Optional[str]:
-    """Extract ID from element documentation or element_id."""
-    # First try to get ID from documentation
-    for doc in element.documentation:
-        if "ID:" in doc.body:
-            match = re.search(r"ID:\s*([^\s]+)", doc.body)
-            if match:
-                return match.group(1)
-
-    # Fallback to element_id if documentation doesn't contain ID
-    if hasattr(element, 'element_id') and element.element_id:
-        return element.element_id
-
-    return None
-
-def to_type_name(name: str) -> str:
-    """
-    Convert a function name to a valid SysML action def identifier (PascalCase).
-    """
-    words = re.split(r"[\s/\-_]+", name.strip())
-    result = []
-    for word in words:
-        cleaned = re.sub(r"[^A-Za-z0-9]", "", word)
-        if not cleaned:
-            continue
-        if cleaned.isupper() and len(cleaned) > 1:
-            result.append(cleaned)
-        else:
-            result.append(cleaned[0].upper() + cleaned[1:])
-    return "".join(result)
-
 def from_pascal_case(name: str) -> str:
-    """
-    Convert PascalCase to space-separated words.
-    Examples:
-      "ReceiveMissionStatus" -> "Receive Mission Status"
-      "CODESelectCompanies" -> "CODE Select Companies"
-      "DetermineAttitude" -> "Determine Attitude"
-    """
-    # Handle special case for ALL-CAPS prefixes (like CODE)
+    """Convert PascalCase to space-separated words with proper handling of acronyms."""
+    if not name:
+        return name
+
+    # Handle ALL-CAPS prefixes (like CODE)
     result = []
     i = 0
     n = len(name)
 
     # Check for ALL-CAPS prefix
     while i < n and name[i].isupper():
-        # Find the end of the ALL-CAPS sequence
         j = i
         while j < n and name[j].isupper():
             j += 1
@@ -95,123 +42,131 @@ def from_pascal_case(name: str) -> str:
 
     return "".join(result).strip()
 
-# ---------------------------------------------------------------------------
-# Excel export functions
-# ---------------------------------------------------------------------------
+def extract_id_from_text(text: str) -> str:
+    """Extract ID from text using the pattern: /* ID: uuid */"""
+    match = re.search(r"/\*\s*ID:\s*([0-9a-f-]+)\s*\*/", text)
+    return match.group(1) if match else ""
 
-def create_workbook(max_levels: int = 4) -> openpyxl.Workbook:
-    """Create a new workbook with headers for the given number of levels."""
+def get_block_content(text: str, start_pos: int) -> tuple:
+    """Get content of a block starting with {, handling nested braces."""
+    brace_count = 1
+    end_pos = start_pos
+    while end_pos < len(text) and brace_count > 0:
+        if text[end_pos] == '{':
+            brace_count += 1
+        elif text[end_pos] == '}':
+            brace_count -= 1
+        end_pos += 1
+    return text[start_pos:end_pos-1] if brace_count == 0 else "", end_pos
+
+def parse_functions_file(file_path: pathlib.Path) -> List[Dict]:
+    """
+    Parse the SysML file to extract function hierarchy.
+    Returns a list of dictionaries with function information and hierarchy level.
+    """
+    with open(file_path, 'r', encoding='utf-8') as f:
+        content = f.read()
+
+    # Find the FunctionsGenerated package content
+    functions_package_match = re.search(r'package FunctionsGenerated\s*\{', content)
+    if not functions_package_match:
+        print("Error: FunctionsGenerated package not found in file", file=sys.stderr)
+        return []
+
+    start_pos = functions_package_match.end()
+    functions_content, end_pos = get_block_content(content, start_pos)
+
+    # First, find all action definitions
+    action_defs = {}
+    for action_def_match in re.finditer(r'action def (\w+)\s*\{', functions_content):
+        action_name = action_def_match.group(1)
+        start = action_def_match.end()
+        content_block, end = get_block_content(functions_content, start)
+        action_id = extract_id_from_text(content_block)
+
+        # Find all action usages in this action
+        usages = []
+        for usage_match in re.finditer(r'action (\w+)\s*:\s*(\w+);', content_block):
+            usage_name, usage_type = usage_match.groups()
+            usages.append(usage_type)
+
+        action_defs[action_name] = {
+            'id': action_id,
+            'usages': usages,
+            'content': content_block
+        }
+
+    # Build hierarchy
+    functions = []
+
+    # Find top-level functions (not used by any other function)
+    all_used_types = set()
+    for action_name, action_data in action_defs.items():
+        all_used_types.update(action_data['usages'])
+
+    top_level_functions = [name for name in action_defs if name not in all_used_types]
+
+    # Process each top-level function and its hierarchy
+    for top_func_name in top_level_functions:
+        stack = [(top_func_name, 0)]
+        while stack:
+            func_name, level = stack.pop()
+            func_data = action_defs[func_name]
+
+            # Add the function to our list
+            functions.append({
+                'name': func_name,
+                'id': func_data['id'],
+                'level': level
+            })
+
+            # Add children to stack in reverse order (so they're processed in order)
+            for child_type in reversed(func_data['usages']):
+                if child_type in action_defs:
+                    stack.append((child_type, level + 1))
+
+    return functions
+
+def export_functions_to_excel(functions: List[Dict], output_path: pathlib.Path) -> None:
+    """Export all functions to an Excel file with hierarchical structure."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     wb = openpyxl.Workbook()
 
-    # Remove the default sheet if it exists
     if wb.active.title == "Sheet":
         wb.remove(wb.active)
 
-    # Create a new sheet
     ws = wb.create_sheet("Functions")
 
-    # Set headers based on max levels
+    # Determine the maximum hierarchy level
+    max_level = max([f['level'] for f in functions]) if functions else 0
+
+    # Create headers dynamically based on max_level
     headers = []
-    for level in range(max_levels):
+    for level in range(max_level + 1):
         prefix = "Sub" * level if level > 0 else ""
-        headers.extend([
-            f"{prefix}Function ID",
-            f"{prefix}Function Name",
-            f"{prefix}Function Kind"
-        ])
+        headers.extend([f"{prefix}Function ID", f"{prefix}Function Name", f"{prefix}Function Kind"])
 
     for col, header in enumerate(headers, 1):
         ws.cell(row=1, column=col, value=header)
 
-    # Style headers
     for cell in ws[1]:
         cell.fill = PatternFill(start_color="D3D3D3", end_color="D3D3D3", fill_type="solid")
 
-    return wb
+    # Export functions in hierarchy order (already in correct order from parse_functions_file)
+    for func in functions:
+        new_row = ws.max_row + 1
 
-def find_max_hierarchy_level(element: syside.Element) -> int:
-    """Find the maximum hierarchy level in the function structure."""
-    if not hasattr(element, 'owned_elements'):
-        return 0
-
-    max_level = 0
-    for child in element.owned_elements:
-        if isinstance(child, syside.ActionUsage):
-            level = find_max_hierarchy_level(child.types[0]) + 1 if child.types else 0
-            if level > max_level:
-                max_level = level
-
-    return max_level
-
-def add_function_to_sheet(ws: openpyxl.worksheet.worksheet.Worksheet,
-                          function: syside.Element,
-                          level: int = 0) -> None:
-    """
-    Add a function to the worksheet at the appropriate level.
-    Only fills columns for the current level, leaving all higher levels blank.
-    Converts PascalCase names to space-separated words.
-    """
-    # Calculate column indices for this level
-    id_col = 1 + (level * 3)
-    name_col = 2 + (level * 3)
-    kind_col = 3 + (level * 3)
-
-    # Get function ID
-    function_id = get_element_id(function)
-    if not function_id:
-        function_id = ""
-
-    # Convert PascalCase name to space-separated words
-    display_name = from_pascal_case(function.name)
-
-    # Create a new row
-    new_row = ws.max_row + 1
-
-    # ONLY fill in the columns for the current level
-    ws.cell(row=new_row, column=id_col, value=function_id)
-    ws.cell(row=new_row, column=name_col, value=display_name)
-    # Leave kind column empty as requested
-
-    # Process children (action usages) at the next level
-    if hasattr(function, 'owned_elements'):
-        for child in function.owned_elements:
-            if isinstance(child, syside.ActionUsage) and child.types:
-                child_type = child.types[0]
-                if isinstance(child_type, syside.ActionDefinition):
-                    add_function_to_sheet(ws, child_type, level + 1)
-
-def export_functions_to_excel(model: syside.Model, output_path: pathlib.Path) -> None:
-    """Export all functions from the model to an Excel file."""
-    # Create output directory if it doesn't exist
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    # Find the FunctionsGenerated package
-    functions_package = None
-    for element in model.elements(syside.Package, include_subtypes=True):
-        if element.name == "FunctionsGenerated":
-            functions_package = element
-            break
-
-    if not functions_package:
-        print("Error: FunctionsGenerated package not found in model", file=sys.stderr)
-        return
-
-    # Find the maximum hierarchy level
-    max_levels = 1  # At least 1 level (top-level functions)
-    for element in functions_package.owned_elements:
-        if isinstance(element, syside.ActionDefinition):
-            level = find_max_hierarchy_level(element) + 1
-            if level > max_levels:
-                max_levels = level
-
-    # Create workbook with appropriate number of levels
-    wb = create_workbook(max_levels)
-    ws = wb["Functions"]
-
-    # Process all top-level functions
-    for element in functions_package.owned_elements:
-        if isinstance(element, syside.ActionDefinition):
-            add_function_to_sheet(ws, element)
+        # Fill in all columns for this function's level and above
+        for level in range(func['level'] + 1):
+            col = 1 + (level * 3)
+            if level == func['level']:
+                # This is our current level - fill ID and name
+                ws.cell(row=new_row, column=col, value=func['id'])
+                ws.cell(row=new_row, column=col+1, value=from_pascal_case(func['name']))
+                # Leave kind column empty as requested
+            else:
+                # Higher levels - leave empty (will be filled by parent)
+                pass
 
     # Auto-adjust column widths
     for column in ws.columns:
@@ -226,22 +181,13 @@ def export_functions_to_excel(model: syside.Model, output_path: pathlib.Path) ->
         adjusted_width = (max_length + 2) * 1.2
         ws.column_dimensions[column_letter].width = adjusted_width
 
-    # Save the workbook
     wb.save(output_path)
-    print(f"Exported functions to: {output_path}")
-
-# ---------------------------------------------------------------------------
-# Main function
-# ---------------------------------------------------------------------------
+    print(f"Exported {len(functions)} functions to: {output_path}")
 
 def main() -> None:
-    # -----------------------------------------------------------------------
-    # Configure paths here when running directly (without command-line args)
-    # -----------------------------------------------------------------------
     _DVS_DIR = pathlib.Path(__file__).parent.parent
     DEFAULT_INPUT = _DVS_DIR / "Functions_generated.sysml"
     DEFAULT_OUTPUT = _DVS_DIR / "results" / "DVS_Functions_export.xlsx"
-    # -----------------------------------------------------------------------
 
     args = sys.argv[1:]
     if args and args[0] in ("-h", "--help"):
@@ -249,27 +195,25 @@ def main() -> None:
         sys.exit(0)
 
     input_path = pathlib.Path(args[0]) if args else DEFAULT_INPUT
-    if not input_path or not input_path.exists():
-        if not args:
-            print("Error: set DEFAULT_INPUT or pass the file as an argument.", file=sys.stderr)
-        else:
-            print(f"Error: file not found: {input_path}", file=sys.stderr)
+    if not input_path.exists():
+        print(f"Error: file not found: {input_path}", file=sys.stderr)
         sys.exit(1)
 
     output_path = DEFAULT_OUTPUT if len(args) < 2 else pathlib.Path(args[1])
 
-    print(f"Reading:  {input_path}")
+    print(f"Reading: {input_path}")
+    functions = parse_functions_file(input_path)
 
-    # Load the SysML model
-    model, diagnostics = syside.load_model([input_path])
-    if diagnostics.contains_errors():
-        print("Errors loading model:", file=sys.stderr)
-        for d in diagnostics:
-            print(f"  {d}", file=sys.stderr)
-        sys.exit(1)
+    if not functions:
+        print("Warning: No functions found in the file!")
+    else:
+        print(f"Found {len(functions)} functions in the file")
+        # Print hierarchy for verification
+        for func in functions:
+            indent = "  " * func['level']
+            print(f"{indent}{func['name']} (Level {func['level']}, ID: {func['id']})")
 
-    # Export to Excel
-    export_functions_to_excel(model, output_path)
+    export_functions_to_excel(functions, output_path)
 
 if __name__ == "__main__":
     main()
