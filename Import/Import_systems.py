@@ -10,21 +10,29 @@ Expected file layout (one row per component, blank cells inherit parent context)
   | abc123    | Logical System |           |                |                 |                   |
   |           |             | def456       | EPS            |                 |                   |
   |           |             | ghi789       | ADCS           |                 |                   |
-  |           |             |              |                | jkl012          | SE team            |
 
 Each pair of columns (ID, Name) represents one hierarchy level.
 A row with data in level N is a child of the most recent row with data in level N-1.
+
+ID placement rule:
+  - A type that is used as a part usage inside another part def keeps its ID in the usage block.
+  - A type that only appears as a top-level part def (never used as a child) keeps its ID in the def.
 
 Usage:
   python import_parts_from_excel.py <input.xlsx|input.csv> [output.sysml] [PackageName]
 
 Requirements:
   pip install openpyxl
+
+Modification:
+  - Part names are now made unique by appending the first 4 characters of their ID
+  - This ensures no duplicate names in the SysML syntax
 """
 
 import csv
 import pathlib
 import re
+import subprocess
 import sys
 from dataclasses import dataclass, field
 from typing import Optional
@@ -35,9 +43,7 @@ except ImportError:
     print("Error: openpyxl is required. Install it with: pip install openpyxl", file=sys.stderr)
     sys.exit(1)
 
-
 INDENT = "    "
-
 
 # ---------------------------------------------------------------------------
 # Data model
@@ -49,22 +55,20 @@ class PartNode:
     id: str = ""
     children: list["PartNode"] = field(default_factory=list)
 
-
 # ---------------------------------------------------------------------------
 # Name conversion helpers
 # ---------------------------------------------------------------------------
 
-def to_type_name(name: str) -> str:
+def to_type_name(name: str, part_id: str = "") -> str:
     """
     Convert a part name to a valid SysML part def identifier (PascalCase).
     ALL-CAPS abbreviations (EPS, ADCS, OBC) are preserved as-is.
+    Appends first 4 characters of ID to ensure uniqueness.
 
     Examples:
-      "Logical System"      -> "LogicalSystem"
-      "EPS"                 -> "EPS"
-      "SE team"             -> "SETeam"
-      "Da Vinci Satellite"  -> "DaVinciSatellite"
-      "Place/keep mode"     -> "PlaceKeepMode"
+      "Logical System" with ID "abc123..." -> "LogicalSystem_abcd"
+      "EPS" with ID "def456..." -> "EPS_def4"
+      "SE team" with ID "ghi789..." -> "SETeam_ghi7"
     """
     words = re.split(r"[\s/\-_]+", name.strip())
     result = []
@@ -76,22 +80,26 @@ def to_type_name(name: str) -> str:
             result.append(cleaned)          # keep abbreviations intact
         else:
             result.append(cleaned[0].upper() + cleaned[1:])
-    return "".join(result)
+    type_name = "".join(result)
 
+    # Append first 4 characters of ID if available
+    if part_id:
+        id_prefix = part_id[:4]
+        return f"{type_name}_{id_prefix}"
+    return type_name
 
-def to_usage_name(name: str) -> str:
+def to_usage_name(name: str, part_id: str = "") -> str:
     """
     Convert a part name to a valid SysML part usage identifier (camelCase).
     Initial ALL-CAPS abbreviations are lowercased as a group.
+    Appends first 4 characters of ID to ensure uniqueness.
 
     Examples:
-      "Logical System"  -> "logicalSystem"
-      "EPS"             -> "eps"
-      "SE team"         -> "seTeam"
-      "AIV team"        -> "aivTeam"
-      "BitflipPayload"  -> "bitflipPayload"
+      "Logical System" with ID "abc123..." -> "logicalSystem_abcd"
+      "EPS" with ID "def456..." -> "eps_def4"
+      "SE team" with ID "ghi789..." -> "seTeam_ghi7"
     """
-    type_name = to_type_name(name)
+    type_name = to_type_name(name, part_id)
     if not type_name:
         return name
 
@@ -101,10 +109,21 @@ def to_usage_name(name: str) -> str:
     n = len(type_name)
     end_prefix = 0
 
+    # First find where the ID prefix starts (after the underscore)
+    underscore_pos = type_name.find('_')
+    if underscore_pos != -1:
+        # Process only the name part before the underscore
+        name_part = type_name[:underscore_pos]
+        id_part = type_name[underscore_pos:]
+    else:
+        name_part = type_name
+        id_part = ""
+
+    n = len(name_part)
     for i in range(n):
-        ch = type_name[i]
+        ch = name_part[i]
         if ch.isupper():
-            next_is_lower = (i + 1 < n and type_name[i + 1].islower())
+            next_is_lower = (i + 1 < n and name_part[i + 1].islower())
             if next_is_lower and i > 0:
                 # This capital starts a new word after an abbreviation → stop here
                 end_prefix = i
@@ -117,8 +136,8 @@ def to_usage_name(name: str) -> str:
     if end_prefix == 0:
         end_prefix = 1
 
-    return type_name[:end_prefix].lower() + type_name[end_prefix:]
-
+    camel_name = name_part[:end_prefix].lower() + name_part[end_prefix:]
+    return f"{camel_name}{id_part}"
 
 # ---------------------------------------------------------------------------
 # Excel / CSV parsing
@@ -146,7 +165,6 @@ def _detect_level_columns(header: tuple) -> list[tuple[int, int]]:
                 pairs.append((id_col, name_col))
                 break
     return pairs
-
 
 def _parse_rows(rows: list[tuple]) -> list[PartNode]:
     """
@@ -194,13 +212,11 @@ def _parse_rows(rows: list[tuple]) -> list[PartNode]:
 
     return roots
 
-
 def read_excel(path: pathlib.Path) -> list[PartNode]:
     wb = openpyxl.load_workbook(path, data_only=True)
     ws = wb.active
     rows = list(ws.iter_rows(values_only=True))
     return _parse_rows(rows)
-
 
 def read_csv(path: pathlib.Path) -> list[PartNode]:
     # Auto-detect delimiter (semicolon or comma)
@@ -210,7 +226,6 @@ def read_csv(path: pathlib.Path) -> list[PartNode]:
         reader = csv.reader(f, delimiter=delimiter)
         rows = [tuple(row) for row in reader]
     return _parse_rows(rows)
-
 
 def load_parts(path: pathlib.Path) -> list[PartNode]:
     suffix = path.suffix.lower()
@@ -225,7 +240,6 @@ def load_parts(path: pathlib.Path) -> list[PartNode]:
         except Exception:
             return read_csv(path)
 
-
 # ---------------------------------------------------------------------------
 # SysML v2 code generation
 # ---------------------------------------------------------------------------
@@ -235,11 +249,13 @@ def _collect_canonical_types(parts: list[PartNode]) -> dict[str, PartNode]:
     Walk the tree and build a dict of type_name -> canonical PartNode.
     When two nodes share the same type name, prefer the one that has children
     (it carries structural information needed for the part def body).
+    Now uses the modified type name with ID prefix.
     """
     canonical: dict[str, PartNode] = {}
 
     def walk(node: PartNode) -> None:
-        tname = to_type_name(node.name)
+        # Use the node's ID to create a unique type name
+        tname = to_type_name(node.name, node.id)
         if tname not in canonical:
             canonical[tname] = node
         elif node.children and not canonical[tname].children:
@@ -251,39 +267,62 @@ def _collect_canonical_types(parts: list[PartNode]) -> dict[str, PartNode]:
         walk(root)
     return canonical
 
+def _collect_all_ids(parts: list[PartNode]) -> dict[str, list[str]]:
+    """Return a mapping of type_name -> list of all IDs that share that type name.
+    Now uses the modified type name with ID prefix.
+    """
+    all_ids: dict[str, list[str]] = {}
+
+    def walk(node: PartNode) -> None:
+        # Use the node's ID to create a unique type name
+        tname = to_type_name(node.name, node.id)
+        if node.id and node.id not in all_ids.get(tname, []):
+            all_ids.setdefault(tname, []).append(node.id)
+        for child in node.children:
+            walk(child)
+
+    for root in parts:
+        walk(root)
+    return all_ids
 
 def generate_sysml(parts: list[PartNode], package_name: str = "Parts") -> str:
     """
     Produce a complete SysML v2 package string.
 
-    Output order mirrors the input order: each part def is followed immediately
-    by the defs of its direct children (if not already emitted).
-    This matches the convention used in the rest of the DVS model.
+    IDs always go in the part def block. When multiple Excel rows share the same
+    type name (e.g. two "Ground station" entries), all their IDs are written so
+    that the exchange script can inject ports for every variant.
+
+    Part usages are plain single-line declarations so that ports land on the
+    canonical part def and are reachable from package-level connection defs.
     """
     canonical = _collect_canonical_types(parts)
+    all_ids   = _collect_all_ids(parts)
     emitted: set[str] = set()
+
     lines: list[str] = [f"package {package_name} {{", ""]
 
     def emit(node: PartNode) -> None:
-        tname = to_type_name(node.name)
+        # Use the node's ID to create a unique type name
+        tname = to_type_name(node.name, node.id)
         if tname in emitted:
             return
         emitted.add(tname)
 
-        cn = canonical[tname]   # use the canonical (possibly richer) version
+        cn = canonical[tname]
 
         lines.append(f"{INDENT}part def {tname} {{")
-        if cn.id:
-            lines.append(f"{INDENT * 2}/* ID: {cn.id} */")
+        for id_val in all_ids.get(tname, []):
+            lines.append(f"{INDENT * 2}doc")
+            lines.append(f"{INDENT * 2}/* ID: {id_val} */")
         for child in cn.children:
-            child_type = to_type_name(child.name)
-            child_usage = to_usage_name(child.name)
+            # For child usages, use the child's ID to create unique usage name
+            child_type = to_type_name(child.name, child.id)
+            child_usage = to_usage_name(child.name, child.id)
             lines.append(f"{INDENT * 2}part {child_usage} : {child_type};")
         lines.append(f"{INDENT}}}")
-
         lines.append("")
 
-        # Emit child defs immediately after their parent (depth-first)
         for child in cn.children:
             emit(child)
 
@@ -293,26 +332,26 @@ def generate_sysml(parts: list[PartNode], package_name: str = "Parts") -> str:
     lines.append("}")
     return "\n".join(lines)
 
+# ---------------------------------------------------------------------------
+# Validation (optional syside check)
+# ---------------------------------------------------------------------------
 
-# # ---------------------------------------------------------------------------
-# # Validation (optional syside check)
-# # ---------------------------------------------------------------------------
-
-# def validate(sysml_path: pathlib.Path) -> bool:
-#     try:
-#         import syside
-#         model, diagnostics = syside.load_model([sysml_path])
-#         if diagnostics.contains_errors():
-#             print("Validation errors:")
-#             for d in diagnostics:
-#                 print(f"  {d}")
-#             return False
-#         print("Validation passed (no errors).")
-#         return True
-#     except Exception as exc:
-#         print(f"Could not validate with syside: {exc}")
-#         return False
-
+def validate(sysml_path: pathlib.Path) -> bool:
+    try:
+        proc = subprocess.run(
+            ["syside", "check", str(sysml_path)],
+            capture_output=True, text=True
+        )
+        output = proc.stdout + proc.stderr
+        if proc.returncode != 0 or "error" in output.lower():
+            print("Validation errors:")
+            print(output)
+            return False
+        print("Validation passed (no errors).")
+        return True
+    except FileNotFoundError:
+        print("syside not found — skipping validation.")
+        return True
 
 # ---------------------------------------------------------------------------
 # Entry point
@@ -368,8 +407,7 @@ def main() -> None:
     output_path.write_text(sysml, encoding="utf-8")
     print(f"Written:  {output_path}")
 
-    # validate(output_path)
-
+    validate(output_path)
 
 if __name__ == "__main__":
     main()

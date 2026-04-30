@@ -14,7 +14,7 @@ Expected file layout:
 
 - Rows with a Function ID start a new top-level action def.
 - Rows with only a SubFunction ID are subfunctions of the preceding top-level function.
-- Duplicate function names (same PascalCase result) are disambiguated by appending _2, _3, etc.
+- Function names are made unique by appending the first 4 characters of their ID.
 
 Usage:
   python import_functions_from_excel.py <input.xlsx|input.csv> [output.sysml] [PackageName]
@@ -35,9 +35,7 @@ except ImportError:
     print("Error: openpyxl is required. Install it with: pip install openpyxl", file=sys.stderr)
     sys.exit(1)
 
-
 INDENT = "    "
-
 
 # ---------------------------------------------------------------------------
 # Data model
@@ -50,20 +48,19 @@ class FunctionNode:
     kind: str = "FUNCTION"
     children: list["FunctionNode"] = field(default_factory=list)
 
-
 # ---------------------------------------------------------------------------
-# Name conversion  (identical rules to the parts import script)
+# Name conversion
 # ---------------------------------------------------------------------------
 
-def to_type_name(name: str) -> str:
+def to_type_name(name: str, func_id: str = "") -> str:
     """
     PascalCase identifier for an action def, preserving ALL-CAPS abbreviations.
+    Appends first 4 characters of ID to ensure uniqueness.
 
     Examples:
-      "Receive mission status"       -> "ReceiveMissionStatus"
-      "CODE - Select companies"      -> "CODESelectCompanies"
-      "Number of bitflips"           -> "NumberOfBitflips"
-      "Place/keep satellite in mode" -> "PlaceKeepSatelliteInMode"
+      "Receive mission status" with ID "17184e40..." -> "ReceiveMissionStatus_1718"
+      "CODE - Select companies" with ID "91c339dd..." -> "CODESelectCompanies_91c3"
+      "Number of bitflips" with ID "ac1a9c7b..." -> "NumberOfBitflips_ac1a"
     """
     words = re.split(r"[\s/\-_]+", name.strip())
     result = []
@@ -72,32 +69,49 @@ def to_type_name(name: str) -> str:
         if not cleaned:
             continue
         if cleaned.isupper() and len(cleaned) > 1:
-            result.append(cleaned)
+            result.append(cleaned)          # keep abbreviations intact
         else:
             result.append(cleaned[0].upper() + cleaned[1:])
-    return "".join(result)
+    type_name = "".join(result)
 
+    # Append first 4 characters of ID if available
+    if func_id:
+        id_prefix = func_id[:4]
+        return f"{type_name}_{id_prefix}"
+    return type_name
 
-def to_usage_name(name: str) -> str:
+def to_usage_name(name: str, func_id: str = "") -> str:
     """
     camelCase identifier for an action usage.
     Initial ALL-CAPS abbreviations are lowercased as a group.
+    Appends first 4 characters of ID to ensure uniqueness.
 
     Examples:
-      "Receive mission status" -> "receiveMissionStatus"
-      "EPS"                    -> "eps"
-      "CODE - test 1"          -> "cODETest1"   (CODE treated as abbreviation)
+      "Receive mission status" with ID "17184e40..." -> "receiveMissionStatus_1718"
+      "EPS" with ID "91c339dd..." -> "eps_91c3"
+      "CODE - test 1" with ID "ac1a9c7b..." -> "cODETest1_ac1a"
     """
-    type_name = to_type_name(name)
+    type_name = to_type_name(name, func_id)
     if not type_name:
         return name
 
-    n = len(type_name)
+    # Find where the ID suffix starts (after the underscore)
+    underscore_pos = type_name.find('_')
+    if underscore_pos != -1:
+        # Process only the name part before the underscore
+        name_part = type_name[:underscore_pos]
+        id_part = type_name[underscore_pos:]
+    else:
+        name_part = type_name
+        id_part = ""
+
+    n = len(name_part)
     end_prefix = 0
     for i in range(n):
-        if type_name[i].isupper():
-            next_is_lower = (i + 1 < n and type_name[i + 1].islower())
+        if name_part[i].isupper():
+            next_is_lower = (i + 1 < n and name_part[i + 1].islower())
             if next_is_lower and i > 0:
+                # This capital starts a new word after an abbreviation → stop here
                 end_prefix = i
                 break
             else:
@@ -108,8 +122,8 @@ def to_usage_name(name: str) -> str:
     if end_prefix == 0:
         end_prefix = 1
 
-    return type_name[:end_prefix].lower() + type_name[end_prefix:]
-
+    camel_name = name_part[:end_prefix].lower() + name_part[end_prefix:]
+    return f"{camel_name}{id_part}"
 
 # ---------------------------------------------------------------------------
 # Excel / CSV parsing
@@ -130,7 +144,6 @@ def _detect_id_name_pairs(header: tuple) -> list[tuple[int, int]]:
                     break
     return pairs
 
-
 def _detect_kind_col(header: tuple, id_col: int) -> int:
     """Return the column index of the Kind cell for a given level, or -1 if not found."""
     h = [str(c).lower().strip() if c else "" for c in header]
@@ -138,7 +151,6 @@ def _detect_kind_col(header: tuple, id_col: int) -> int:
         if "kind" in h[col] or "type" in h[col]:
             return col
     return -1
-
 
 def _parse_rows(rows: list[tuple]) -> list[FunctionNode]:
     """
@@ -193,12 +205,10 @@ def _parse_rows(rows: list[tuple]) -> list[FunctionNode]:
 
     return roots
 
-
 def read_excel(path: pathlib.Path) -> list[FunctionNode]:
     wb = openpyxl.load_workbook(path, data_only=True)
     ws = wb.active
     return _parse_rows(list(ws.iter_rows(values_only=True)))
-
 
 def read_csv(path: pathlib.Path) -> list[FunctionNode]:
     sample = path.read_text(encoding="utf-8-sig")[:2048]
@@ -206,7 +216,6 @@ def read_csv(path: pathlib.Path) -> list[FunctionNode]:
     with path.open(encoding="utf-8-sig") as f:
         rows = [tuple(row) for row in csv.reader(f, delimiter=delimiter)]
     return _parse_rows(rows)
-
 
 def load_functions(path: pathlib.Path) -> list[FunctionNode]:
     suffix = path.suffix.lower()
@@ -219,35 +228,6 @@ def load_functions(path: pathlib.Path) -> list[FunctionNode]:
     except Exception:
         return read_csv(path)
 
-
-# ---------------------------------------------------------------------------
-# Deduplication
-# ---------------------------------------------------------------------------
-
-def _deduplicate_names(nodes: list[FunctionNode]) -> None:
-    """
-    Walk the full tree and rename any action def whose PascalCase name collides
-    with a previously seen name by appending _2, _3, etc.
-
-    This is an in-place operation; it modifies node.name directly so that
-    to_type_name(node.name) yields a unique identifier.
-    """
-    seen: dict[str, int] = {}  # canonical_name -> count of occurrences so far
-
-    def walk(node: FunctionNode) -> None:
-        tname = to_type_name(node.name)
-        if tname in seen:
-            seen[tname] += 1
-            node.name = node.name + f" {seen[tname]}"   # append number to raw name
-        else:
-            seen[tname] = 1
-        for child in node.children:
-            walk(child)
-
-    for root in nodes:
-        walk(root)
-
-
 # ---------------------------------------------------------------------------
 # SysML v2 code generation
 # ---------------------------------------------------------------------------
@@ -257,7 +237,8 @@ def _collect_canonical(nodes: list[FunctionNode]) -> dict[str, FunctionNode]:
     canonical: dict[str, FunctionNode] = {}
 
     def walk(node: FunctionNode) -> None:
-        tname = to_type_name(node.name)
+        # Use the node's ID to create a unique type name
+        tname = to_type_name(node.name, node.id)
         if tname not in canonical:
             canonical[tname] = node
         elif node.children and not canonical[tname].children:
@@ -268,7 +249,6 @@ def _collect_canonical(nodes: list[FunctionNode]) -> dict[str, FunctionNode]:
     for root in nodes:
         walk(root)
     return canonical
-
 
 def generate_sysml(functions: list[FunctionNode], package_name: str = "Functions") -> str:
     """
@@ -297,7 +277,8 @@ def generate_sysml(functions: list[FunctionNode], package_name: str = "Functions
     lines: list[str] = [f"package {package_name} {{", ""]
 
     def emit(node: FunctionNode) -> None:
-        tname = to_type_name(node.name)
+        # Use the node's ID to create a unique type name
+        tname = to_type_name(node.name, node.id)
         if tname in emitted:
             return
         emitted.add(tname)
@@ -305,10 +286,12 @@ def generate_sysml(functions: list[FunctionNode], package_name: str = "Functions
         cn = canonical[tname]
         lines.append(f"{INDENT}action def {tname} {{")
         if cn.id:
+            lines.append(f"{INDENT * 2}doc")
             lines.append(f"{INDENT * 2}/* ID: {cn.id} */")
         for child in cn.children:
-            child_type = to_type_name(child.name)
-            child_usage = to_usage_name(child.name)
+            # For child usages, use the child's ID to create unique usage name
+            child_type = to_type_name(child.name, child.id)
+            child_usage = to_usage_name(child.name, child.id)
             lines.append(f"{INDENT * 2}action {child_usage} : {child_type};")
         lines.append(f"{INDENT}}}")
         lines.append("")
@@ -322,41 +305,34 @@ def generate_sysml(functions: list[FunctionNode], package_name: str = "Functions
     lines.append("}")
     return "\n".join(lines)
 
+# ---------------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------------
 
-# # ---------------------------------------------------------------------------
-# # Validation
-# # ---------------------------------------------------------------------------
-
-# def validate(path: pathlib.Path) -> bool:
-#     try:
-#         import syside
-#         _, diagnostics = syside.load_model([path])
-#         if diagnostics.contains_errors():
-#             print("Validation errors:")
-#             for d in diagnostics:
-#                 print(f"  {d}")
-#             return False
-#         print("Validation passed (no errors).")
-#         return True
-#     except Exception as exc:
-#         print(f"Could not validate with syside: {exc}")
-#         return False
-
+def validate(path: pathlib.Path) -> bool:
+    try:
+        import syside
+        _, diagnostics = syside.load_model([path])
+        if diagnostics.contains_errors():
+            print("Validation errors:")
+            for d in diagnostics:
+                print(f"  {d}")
+            return False
+        print("Validation passed (no errors).")
+        return True
+    except Exception as exc:
+        print(f"Could not validate with syside: {exc}")
+        return False
 
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    # -----------------------------------------------------------------------
-    # Configure paths here when running directly (without command-line args)
-    # Paths are relative to this script's location (DVS/scripts/).
-    # -----------------------------------------------------------------------
     _DVS_DIR        = pathlib.Path(__file__).parent.parent
     DEFAULT_INPUT   = _DVS_DIR / "data" / "DVS_Logical_Functions.xlsx"
     DEFAULT_OUTPUT  = _DVS_DIR / "Functions_generated.sysml"
-    DEFAULT_PACKAGE = ""        # leave "" to derive from output filename
-    # -----------------------------------------------------------------------
+    DEFAULT_PACKAGE = ""
 
     args = sys.argv[1:]
     if args and args[0] in ("-h", "--help"):
@@ -389,8 +365,6 @@ def main() -> None:
         print("No functions found in the input file. Check the column layout.", file=sys.stderr)
         sys.exit(1)
 
-    _deduplicate_names(functions)
-
     total = sum(1 for _ in _collect_canonical(functions))
     parents = sum(1 for n in _collect_canonical(functions).values() if n.children)
     print(f"Found:    {len(functions)} top-level functions, {total} unique action defs ({parents} with subfunctions)")
@@ -400,8 +374,7 @@ def main() -> None:
     output_path.write_text(sysml, encoding="utf-8")
     print(f"Written:  {output_path}")
 
-    # validate(output_path)
-
+    validate(output_path)
 
 if __name__ == "__main__":
     main()

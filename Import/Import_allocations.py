@@ -15,12 +15,18 @@ appears in the column header — so any depth of Sub...System and Sub...Function
 columns is handled automatically.
 
 Usage:
-  python import_allocations_from_excel.py [input.xlsx] [parts.sysml] [functions_pkg]
+  python import_allocations_from_excel.py [input.xlsx] [parts.sysml] [functions.sysml] [functions_pkg]
 
 Defaults:
   input    : DVS/data/DVS_Function_System_Links.xlsx
   parts    : DVS/Parts_generated.sysml
-  functions: FunctionsGenerated
+  functions: DVS/Functions_generated.sysml
+  functions_pkg: FunctionsGenerated
+
+Modification:
+  - Now handles part and function names with ID prefixes (first 4 chars)
+  - Matches names like "EPS_cc31" and "StoreEnergyInTheBatteries_baf4"
+  - Reads functions file to get correct function names with ID prefixes
 """
 
 import csv
@@ -39,7 +45,6 @@ except ImportError:
 
 INDENT = "    "  # 4 spaces
 
-
 @dataclass
 class Allocation:
     target_system_path: List[str]  # e.g. ["Logical System", "EPS"]
@@ -47,13 +52,20 @@ class Allocation:
     function_name: str
     function_id: str
 
-
 # ---------------------------------------------------------------------------
 # Name conversion helpers
 # ---------------------------------------------------------------------------
 
-def to_type_name(name: str) -> str:
-    """Convert a name to PascalCase SysML type identifier. ALL-CAPS abbreviations are kept."""
+def to_type_name(name: str, item_id: str = "") -> str:
+    """
+    Convert a name to PascalCase SysML type identifier. ALL-CAPS abbreviations are kept.
+    Appends first 4 characters of ID to ensure uniqueness.
+
+    Examples:
+      "Logical System" with ID "e9b6..." -> "LogicalSystem_e9b6"
+      "EPS" with ID "cc31..." -> "EPS_cc31"
+      "Store Energy In The Batteries" with ID "baf4..." -> "StoreEnergyInTheBatteries_baf4"
+    """
     words = re.split(r"[\s/\-_]+", name.strip())
     result = []
     for word in words:
@@ -64,20 +76,45 @@ def to_type_name(name: str) -> str:
             result.append(cleaned)
         else:
             result.append(cleaned[0].upper() + cleaned[1:])
-    return "".join(result)
+    type_name = "".join(result)
 
+    # Append first 4 characters of ID if available
+    if item_id:
+        id_prefix = item_id[:4]
+        return f"{type_name}_{id_prefix}"
+    return type_name
 
-def to_usage_name(name: str) -> str:
-    """Convert a name to camelCase SysML usage identifier."""
-    type_name = to_type_name(name)
+def to_usage_name(name: str, item_id: str = "") -> str:
+    """
+    Convert a name to camelCase SysML usage identifier.
+    Initial ALL-CAPS abbreviations are lowercased as a group.
+    Appends first 4 characters of ID to ensure uniqueness.
+
+    Examples:
+      "Logical System" with ID "e9b6..." -> "logicalSystem_e9b6"
+      "EPS" with ID "cc31..." -> "eps_cc31"
+      "Store Energy In The Batteries" with ID "baf4..." -> "storeEnergyInTheBatteries_baf4"
+    """
+    type_name = to_type_name(name, item_id)
     if not type_name:
         return name
-    n = len(type_name)
+
+    # Find where the ID suffix starts (after the underscore)
+    underscore_pos = type_name.find('_')
+    if underscore_pos != -1:
+        # Process only the name part before the underscore
+        name_part = type_name[:underscore_pos]
+        id_part = type_name[underscore_pos:]
+    else:
+        name_part = type_name
+        id_part = ""
+
+    n = len(name_part)
     end_prefix = 0
     for i in range(n):
-        ch = type_name[i]
+        ch = name_part[i]
         if ch.isupper():
-            next_is_lower = (i + 1 < n and type_name[i + 1].islower())
+            next_is_lower = (i + 1 < n and name_part[i + 1].islower())
             if next_is_lower and i > 0:
                 end_prefix = i
                 break
@@ -85,10 +122,134 @@ def to_usage_name(name: str) -> str:
                 end_prefix = i + 1
         else:
             break
+
     if end_prefix == 0:
         end_prefix = 1
-    return type_name[:end_prefix].lower() + type_name[end_prefix:]
 
+    camel_name = name_part[:end_prefix].lower() + name_part[end_prefix:]
+    return f"{camel_name}{id_part}"
+
+def extract_id_prefix_from_name(name: str) -> str:
+    """
+    Extract the ID prefix from a name that has an ID suffix.
+    Returns the ID prefix if found, otherwise returns empty string.
+
+    Examples:
+      "EPS_cc31" -> "cc31"
+      "StoreEnergyInTheBatteries_baf4" -> "baf4"
+      "LogicalSystem" -> ""
+    """
+    underscore_pos = name.rfind('_')
+    if underscore_pos != -1 and len(name) > underscore_pos + 1:
+        # Check if the part after underscore looks like an ID prefix (4 hex chars)
+        suffix = name[underscore_pos+1:]
+        if len(suffix) == 4 and all(c in '0123456789abcdef' for c in suffix.lower()):
+            return suffix
+    return ""
+
+def get_all_part_defs(content: str) -> Dict[str, str]:
+    """
+    Extract all part definitions from the SysML content.
+    Returns a dictionary of {type_name: full_definition}
+    """
+    part_defs = {}
+    pattern = r'part def (\w+)\s*\{([^}]*)\}'
+    for match in re.finditer(pattern, content, re.DOTALL):
+        type_name = match.group(1)
+        part_defs[type_name] = match.group(0)
+    return part_defs
+
+def get_function_id_to_name_map(content: str) -> Dict[str, str]:
+    """
+    Extract a mapping from function IDs to their type names from the SysML content.
+    Returns a dictionary of {function_id: type_name}
+    """
+    function_id_to_name = {}
+
+    # Find all action definitions
+    action_def_pattern = r'action def (\w+)\s*\{([^}]*)\}'
+    for match in re.finditer(action_def_pattern, content, re.DOTALL):
+        type_name = match.group(1)
+        action_content = match.group(2)
+
+        # Extract ID from the action definition
+        id_match = re.search(r'/\*\s*ID:\s*([0-9a-f-]+)\s*\*/', action_content)
+        if id_match:
+            function_id = id_match.group(1)
+            function_id_to_name[function_id] = type_name
+
+    return function_id_to_name
+
+def find_best_part_match(target_name: str, part_defs: Dict[str, str], target_id: str = "") -> Optional[str]:
+    """
+    Find the best matching part definition for a target name.
+    Tries:
+    1. Exact match (with ID prefix)
+    2. Match without ID prefix
+    3. Match by ID prefix only
+    """
+    # First try exact match
+    if target_name in part_defs:
+        return target_name
+
+    # Try without ID prefix
+    base_name = target_name
+    underscore_pos = target_name.rfind('_')
+    if underscore_pos != -1:
+        base_name = target_name[:underscore_pos]
+        if base_name in part_defs:
+            return base_name
+
+    # Try to match by ID prefix
+    if target_id:
+        id_prefix = target_id[:4]
+        for part_name in part_defs:
+            part_id_prefix = extract_id_prefix_from_name(part_name)
+            if part_id_prefix == id_prefix:
+                return part_name
+
+    # Try to find any part that starts with the base name
+    for part_name in part_defs:
+        if part_name.startswith(base_name + "_"):
+            return part_name
+        if part_name.startswith(base_name):
+            return part_name
+
+    return None
+
+def find_best_function_match(target_name: str, target_id: str, function_id_to_name: Dict[str, str]) -> str:
+    """
+    Find the best matching function name for a target function.
+    Tries:
+    1. Exact match (with ID prefix)
+    2. Match by ID
+    3. Match by base name (without ID prefix)
+    """
+    # First try exact match
+    if target_name in function_id_to_name.values():
+        return target_name
+
+    # Try to match by ID
+    if target_id in function_id_to_name:
+        return function_id_to_name[target_id]
+
+    # Try to match by base name (without ID prefix)
+    base_name = target_name
+    underscore_pos = target_name.rfind('_')
+    if underscore_pos != -1:
+        base_name = target_name[:underscore_pos]
+
+    for type_name in function_id_to_name.values():
+        type_base = type_name
+        type_underscore_pos = type_name.rfind('_')
+        if type_underscore_pos != -1:
+            type_base = type_name[:type_underscore_pos]
+
+        if type_base == base_name:
+            return type_name
+
+    # If all else fails, return the original name with ID prefix
+    return to_type_name(target_name, target_id)
 
 # ---------------------------------------------------------------------------
 # Excel / CSV parsing
@@ -117,7 +278,6 @@ def _detect_columns(
                 break
 
     return system_pairs, function_pairs
-
 
 def _parse_allocation_rows(rows: List[Tuple]) -> List[Allocation]:
     if not rows:
@@ -175,12 +335,10 @@ def _parse_allocation_rows(rows: List[Tuple]) -> List[Allocation]:
 
     return allocations
 
-
 def read_excel(path: pathlib.Path) -> List[Allocation]:
     wb = openpyxl.load_workbook(path, data_only=True)
     ws = wb.active
     return _parse_allocation_rows(list(ws.iter_rows(values_only=True)))
-
 
 def read_csv(path: pathlib.Path) -> List[Allocation]:
     sample = path.read_text(encoding="utf-8-sig")[:2048]
@@ -188,7 +346,6 @@ def read_csv(path: pathlib.Path) -> List[Allocation]:
     with path.open(encoding="utf-8-sig") as f:
         rows = [tuple(row) for row in csv.reader(f, delimiter=delimiter)]
     return _parse_allocation_rows(rows)
-
 
 def load_allocations(path: pathlib.Path) -> List[Allocation]:
     suffix = path.suffix.lower()
@@ -200,7 +357,6 @@ def load_allocations(path: pathlib.Path) -> List[Allocation]:
         return read_excel(path)
     except Exception:
         return read_csv(path)
-
 
 # ---------------------------------------------------------------------------
 # SysML file manipulation
@@ -217,7 +373,6 @@ def _find_block_end(content: str, brace_pos: int) -> int:
             if depth == 0:
                 return i
     return -1
-
 
 def _strip_perform_actions(content: str) -> str:
     """
@@ -247,7 +402,6 @@ def _strip_perform_actions(content: str) -> str:
 
     return '\n'.join(result)
 
-
 def _ensure_import(content: str, functions_package: str) -> str:
     """Insert 'private import <pkg>::*;' after the package opening brace if absent."""
     import_stmt = f"private import {functions_package}::*;"
@@ -257,7 +411,6 @@ def _ensure_import(content: str, functions_package: str) -> str:
     if not m:
         return content
     return content[:m.end()] + f"\n\n{INDENT}{import_stmt}" + content[m.end():]
-
 
 def _build_perform_block(action_name: str, action_type: str, function_id: str) -> str:
     """Return a formatted 'perform action' block at part-def body indentation (2 levels)."""
@@ -270,25 +423,28 @@ def _build_perform_block(action_name: str, action_type: str, function_id: str) -
         f"{i1}}}",
     ])
 
-
-def _insert_into_part_def(content: str, type_name: str, perform_blocks: List[str]) -> str:
+def _insert_into_part_def(content: str, type_name: str, perform_blocks: List[str], part_defs: Dict[str, str]) -> str:
     """
     Find 'part def TYPE_NAME { ... }' and insert perform_blocks before its closing '}'.
-    If the type is not found, a warning is printed and content is returned unchanged.
+    Uses the part_defs dictionary to find the best match.
     """
-    pattern = rf'\bpart\s+def\s+{re.escape(type_name)}\s*\{{'
+    # Find the best matching part definition
+    matched_name = find_best_part_match(type_name, part_defs)
+    if not matched_name:
+        print(f"Warning: 'part def {type_name}' not found in parts file; allocation skipped.", file=sys.stderr)
+        return content
+
+    # Find the position of the matched part def
+    pattern = rf'part def {re.escape(matched_name)}\s*\{{'
     m = re.search(pattern, content)
     if not m:
-        print(
-            f"Warning: 'part def {type_name}' not found in parts file; allocation skipped.",
-            file=sys.stderr,
-        )
+        print(f"Warning: 'part def {matched_name}' not found in parts file; allocation skipped.", file=sys.stderr)
         return content
 
     brace_pos = m.end() - 1  # position of the opening '{'
     end_pos = _find_block_end(content, brace_pos)
     if end_pos == -1:
-        print(f"Warning: unmatched '{{' for 'part def {type_name}'.", file=sys.stderr)
+        print(f"Warning: unmatched '{{' for 'part def {matched_name}'.", file=sys.stderr)
         return content
 
     # Insert before the line that holds the closing '}' to preserve its indentation
@@ -296,10 +452,10 @@ def _insert_into_part_def(content: str, type_name: str, perform_blocks: List[str
     insert_text = "\n".join(perform_blocks) + "\n"
     return content[:line_start] + insert_text + content[line_start:]
 
-
 def merge_allocations_into_parts(
     parts_content: str,
     allocations: List[Allocation],
+    functions_content: str,
     functions_package: str = "FunctionsGenerated",
 ) -> str:
     """
@@ -308,31 +464,43 @@ def merge_allocations_into_parts(
     Steps:
       1. Strip any previously injected perform action blocks (idempotency).
       2. Ensure the functions package import is present.
-      3. Group allocations by the type name of their deepest system.
-      4. Insert perform action blocks into each matching part def.
+      3. Get function ID to name mapping from functions content
+      4. Group allocations by the type name of their deepest system.
+      5. Insert perform action blocks into each matching part def with correct function names.
     """
     content = _strip_perform_actions(parts_content)
     content = _ensure_import(content, functions_package)
 
+    # Get all part definitions from the content
+    part_defs = get_all_part_defs(content)
+
+    # Get function ID to name mapping
+    function_id_to_name = get_function_id_to_name_map(functions_content)
+
     # Group by the SysML type name of the innermost system element
     by_type: Dict[str, List[Allocation]] = {}
     for alloc in allocations:
-        type_name = to_type_name(alloc.target_system_path[-1])
+        # The target system path might already include ID prefixes
+        last_system_name = alloc.target_system_path[-1]
+        # Create the type name with ID prefix
+        type_name = to_type_name(last_system_name, alloc.target_system_id)
         by_type.setdefault(type_name, []).append(alloc)
 
     for type_name, allocs in by_type.items():
-        perform_blocks = [
-            _build_perform_block(
-                to_usage_name(a.function_name),
-                to_type_name(a.function_name),
-                a.function_id,
+        perform_blocks = []
+        for a in allocs:
+            # Find the correct function name with ID prefix
+            matched_function_name = find_best_function_match(a.function_name, a.function_id, function_id_to_name)
+            perform_blocks.append(
+                _build_perform_block(
+                    to_usage_name(a.function_name, a.function_id),
+                    matched_function_name,
+                    a.function_id,
+                )
             )
-            for a in allocs
-        ]
-        content = _insert_into_part_def(content, type_name, perform_blocks)
+        content = _insert_into_part_def(content, type_name, perform_blocks, part_defs)
 
     return content
-
 
 # ---------------------------------------------------------------------------
 # Entry point
@@ -342,6 +510,7 @@ def main() -> None:
     _DVS_DIR = pathlib.Path(__file__).parent.parent
     DEFAULT_INPUT = _DVS_DIR / "data" / "DVS_Function_System_Links.xlsx"
     DEFAULT_PARTS = _DVS_DIR / "Parts_generated.sysml"
+    DEFAULT_FUNCTIONS = _DVS_DIR / "Functions_generated.sysml"
     DEFAULT_FUNCTIONS_PKG = "FunctionsGenerated"
 
     args = sys.argv[1:]
@@ -359,7 +528,12 @@ def main() -> None:
         print(f"Error: parts file not found: {parts_path}", file=sys.stderr)
         sys.exit(1)
 
-    functions_pkg = args[2] if len(args) >= 3 else DEFAULT_FUNCTIONS_PKG
+    functions_path = pathlib.Path(args[2]) if len(args) >= 3 else DEFAULT_FUNCTIONS
+    if not functions_path.exists():
+        print(f"Error: functions file not found: {functions_path}", file=sys.stderr)
+        sys.exit(1)
+
+    functions_pkg = args[3] if len(args) >= 4 else DEFAULT_FUNCTIONS_PKG
 
     print(f"Reading allocations : {input_path}")
     allocations = load_allocations(input_path)
@@ -371,8 +545,11 @@ def main() -> None:
     print(f"Reading parts file  : {parts_path}")
     parts_content = parts_path.read_text(encoding="utf-8")
 
+    print(f"Reading functions file: {functions_path}")
+    functions_content = functions_path.read_text(encoding="utf-8")
+
     print("Merging allocations into parts...")
-    updated = merge_allocations_into_parts(parts_content, allocations, functions_pkg)
+    updated = merge_allocations_into_parts(parts_content, allocations, functions_content, functions_pkg)
 
     parts_path.write_text(updated, encoding="utf-8")
     print(f"Written             : {parts_path}")
@@ -390,7 +567,6 @@ def main() -> None:
             print(result.stderr, file=sys.stderr)
         sys.exit(1)
     print("Validation          : OK")
-
 
 if __name__ == "__main__":
     main()
