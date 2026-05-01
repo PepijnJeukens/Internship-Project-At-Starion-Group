@@ -555,18 +555,21 @@ def main() -> None:
     print(f"Written             : {parts_path}")
 
     # Validate with all files in the same directory so cross-file imports resolve
-    result = subprocess.run(
-        ["syside", "check", str(parts_path.parent)],
-        capture_output=True, text=True,
-    )
-    if result.stdout:
-        print(result.stdout, end="")
-    if result.returncode != 0:
-        print("syside validation errors:", file=sys.stderr)
-        if result.stderr:
-            print(result.stderr, file=sys.stderr)
-        sys.exit(1)
-    print("Validation          : OK")
+    try:
+        result = subprocess.run(
+            ["syside", "check", str(parts_path.parent)],
+            capture_output=True, text=True,
+        )
+        if result.stdout:
+            print(result.stdout, end="")
+        if result.returncode != 0:
+            print("syside validation errors:", file=sys.stderr)
+            if result.stderr:
+                print(result.stderr, file=sys.stderr)
+            sys.exit(1)
+        print("Validation          : OK")
+    except FileNotFoundError:
+        print("syside not found — skipping validation.")
 
 if __name__ == "__main__":
     main()
