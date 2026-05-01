@@ -320,7 +320,7 @@ def validate(path: pathlib.Path) -> bool:
             return False
         print("Validation passed (no errors).")
         return True
-    except FileNotFoundError:
+    except ModuleNotFoundError:
         print("syside not found - skipping validation")
         return True
     except Exception as exc:
