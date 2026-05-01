@@ -2,17 +2,14 @@
 """
 import_component_exchanges_from_excel.py
 Reads DVS_Component_Exchanges.xlsx and augments Parts_generated.sysml with:
-  - port def ExchangeNameConnectionPoint  for each unique exchange
+  - port def ExchangeNameConnectionPoint_<ComponentSuffix>  (two per exchange)
   - port usages inside each participating part def (matched by ID)
+  - interface def ExchangeName_Interface  (with component-specific port types, no conjugation)
   - connection def ExchangeName           for each exchange
 
 Exchange name convention: replace '-' with '_', remove spaces, collapse consecutive '_'.
 Port usage name convention: PortName (no spaces) + '_' + first-4-chars-of-portID.
-
-Modification:
-  - Now handles part names with ID prefixes (first 4 chars)
-  - Matches names like "EPS_cc31" in the parts file
-  - Preserves existing import statements and perform action blocks
+Component suffix: PascalCase of the raw component name from Excel (e.g. OBC, EPS, GroundStation).
 """
 
 import pathlib
@@ -71,7 +68,6 @@ def to_type_name(name: str, item_id: str = "") -> str:
             result.append(cleaned[0].upper() + cleaned[1:])
     type_name = "".join(result)
 
-    # Append first 4 characters of ID if available
     if item_id:
         id_prefix = item_id[:4]
         return f"{type_name}_{id_prefix}"
@@ -86,10 +82,8 @@ def to_usage_name(name: str, item_id: str = "") -> str:
     if not type_name:
         return name
 
-    # Find where the ID suffix starts (after the underscore)
     underscore_pos = type_name.find('_')
     if underscore_pos != -1:
-        # Process only the name part before the underscore
         name_part = type_name[:underscore_pos]
         id_part = type_name[underscore_pos:]
     else:
@@ -135,62 +129,57 @@ def to_port_usage_name(port_name: str, port_id: str) -> str:
     clean = port_name.replace(" ", "")
     return f"{clean}_{port_id[:4]}"
 
-def extract_id_prefix_from_name(name: str) -> str:
-    """
-    Extract the ID prefix from a name that has an ID suffix.
-    Returns the ID prefix if found, otherwise returns empty string.
+def to_component_suffix(raw_name: str) -> str:
+    """Convert a raw component name to a PascalCase suffix for port def names.
 
-    Examples:
-      "EPS_cc31" -> "cc31"
-      "ReceiveMissionStatus_1718" -> "1718"
-      "LogicalSystem" -> ""
+    ALL-CAPS abbreviations are preserved. Examples:
+      'OBC'            -> 'OBC'
+      'EPS'            -> 'EPS'
+      'Ground station' -> 'GroundStation'
+      'Antenna'        -> 'Antenna'
     """
+    words = re.split(r"[\s/\-_]+", raw_name.strip())
+    result = []
+    for word in words:
+        cleaned = re.sub(r"[^A-Za-z0-9]", "", word)
+        if not cleaned:
+            continue
+        if cleaned.isupper() and len(cleaned) > 1:
+            result.append(cleaned)
+        else:
+            result.append(cleaned[0].upper() + cleaned[1:])
+    return "".join(result)
+
+def extract_id_prefix_from_name(name: str) -> str:
+    """Extract the ID prefix from a name that has an ID suffix."""
     underscore_pos = name.rfind('_')
     if underscore_pos != -1 and len(name) > underscore_pos + 1:
-        # Check if the part after underscore looks like an ID prefix (4 hex chars)
         suffix = name[underscore_pos+1:]
         if len(suffix) == 4 and all(c in '0123456789abcdef' for c in suffix.lower()):
             return suffix
     return ""
 
 def get_part_id_to_name_map(content: str) -> Dict[str, str]:
-    """
-    Extract a mapping from part IDs to their type names from the SysML content.
-    Returns a dictionary of {part_id: type_name}
-    """
+    """Extract a mapping from part IDs to their type names from the SysML content."""
     part_id_to_name = {}
-
-    # Find all part definitions
     part_def_pattern = r'part def (\w+)\s*\{([^}]*)\}'
     for match in re.finditer(part_def_pattern, content, re.DOTALL):
         type_name = match.group(1)
         part_content = match.group(2)
-
-        # Extract ID from the part definition
         id_match = re.search(r'/\*\s*ID:\s*([0-9a-f-]+)\s*\*/', part_content)
         if id_match:
             part_id = id_match.group(1)
             part_id_to_name[part_id] = type_name
-
     return part_id_to_name
 
 def match_part_name(part_name: str, part_id: str, id_to_name_map: Dict[str, str]) -> str:
-    """
-    Match a part name from Excel with the actual part name in the SysML file.
-    Tries:
-    1. Exact match
-    2. Match by ID
-    3. Match by base name (without ID prefix)
-    """
-    # First try exact match
+    """Match a part name from Excel with the actual part name in the SysML file."""
     if part_name in id_to_name_map.values():
         return part_name
 
-    # Try to match by ID
     if part_id in id_to_name_map:
         return id_to_name_map[part_id]
 
-    # Try to match by base name (without ID prefix)
     base_name = part_name
     underscore_pos = part_name.rfind('_')
     if underscore_pos != -1:
@@ -201,11 +190,9 @@ def match_part_name(part_name: str, part_id: str, id_to_name_map: Dict[str, str]
         type_underscore_pos = type_name.rfind('_')
         if type_underscore_pos != -1:
             type_base = type_name[:type_underscore_pos]
-
         if type_base == base_name:
             return type_name
 
-    # If all else fails, return the original name with ID prefix
     return to_type_name(part_name, part_id)
 
 # ---------------------------------------------------------------------------
@@ -256,32 +243,41 @@ def _build_part_ports(exchanges: List[Exchange], part_id_to_name: Dict[str, str]
 
     for exch in exchanges:
         exch_name = to_exchange_name(exch.exchange_name)
-        port_def_name = f"{exch_name}ConnectionPoint"
 
-        # Match part names with actual names in the SysML file
+        from_suffix = to_component_suffix(exch.from_part_name)
+        to_suffix = to_component_suffix(exch.to_part_name)
+        from_port_def = f"{exch_name}ConnectionPoint_{from_suffix}"
+        to_port_def = f"{exch_name}ConnectionPoint_{to_suffix}"
+
         from_part_name = match_part_name(exch.from_part_name, exch.from_part_id, part_id_to_name)
         to_part_name = match_part_name(exch.to_part_name, exch.to_part_id, part_id_to_name)
 
         entries = [
-            (from_part_name, exch.from_port_name, exch.from_port_id),
-            (to_part_name,   exch.to_port_name,   exch.to_port_id),
+            (from_part_name, exch.from_port_name, exch.from_port_id, from_port_def),
+            (to_part_name,   exch.to_port_name,   exch.to_port_id,   to_port_def),
         ]
-        for part_name, port_name, port_id in entries:
+        for part_name, port_name, port_id, port_def in entries:
             usage = to_port_usage_name(port_name, port_id)
             if part_name not in part_ports:
                 part_ports[part_name] = []
             if not any(p[0] == usage for p in part_ports[part_name]):
-                part_ports[part_name].append((usage, port_def_name, port_id))
+                part_ports[part_name].append((usage, port_def, port_id))
 
     return part_ports
 
-def _make_interface_def_lines(exch: "Exchange", part_id_to_name: Dict[str, str]) -> List[str]:
-    """Package-level interface def for an exchange."""
+def _make_interface_def_lines(exch: Exchange, part_id_to_name: Dict[str, str]) -> List[str]:
+    """Package-level interface def for an exchange.
+
+    Each end port uses its own component-specific port def type (no conjugation ~).
+    """
     exch_name = to_exchange_name(exch.exchange_name)
-    port_def_name = f"{exch_name}ConnectionPoint"
     iface_name = f"{exch_name}_Interface"
 
-    # Match part names with actual names in the SysML file
+    from_suffix = to_component_suffix(exch.from_part_name)
+    to_suffix = to_component_suffix(exch.to_part_name)
+    from_port_def = f"{exch_name}ConnectionPoint_{from_suffix}"
+    to_port_def = f"{exch_name}ConnectionPoint_{to_suffix}"
+
     from_part_name = match_part_name(exch.from_part_name, exch.from_part_id, part_id_to_name)
     to_part_name = match_part_name(exch.to_part_name, exch.to_part_id, part_id_to_name)
 
@@ -290,17 +286,16 @@ def _make_interface_def_lines(exch: "Exchange", part_id_to_name: Dict[str, str])
 
     return [
         f"{INDENT}interface def {iface_name} {{",
-        f"{INDENT * 2}end port {from_port_end} : {port_def_name};",
-        f"{INDENT * 2}end port {to_port_end} : ~{port_def_name};",
+        f"{INDENT * 2}end port {from_port_end} : {from_port_def};",
+        f"{INDENT * 2}end port {to_port_end} : {to_port_def};",
         f"{INDENT}}}",
         "",
     ]
 
-def _make_conn_def_lines(exch: "Exchange", part_id_to_name: Dict[str, str]) -> List[str]:
+def _make_conn_def_lines(exch: Exchange, part_id_to_name: Dict[str, str]) -> List[str]:
     """Package-level connection def for an exchange."""
     exch_name = to_exchange_name(exch.exchange_name)
 
-    # Match part names with actual names in the SysML file
     from_part_name = match_part_name(exch.from_part_name, exch.from_part_id, part_id_to_name)
     to_part_name = match_part_name(exch.to_part_name, exch.to_part_id, part_id_to_name)
 
@@ -322,9 +317,7 @@ def _make_conn_def_lines(exch: "Exchange", part_id_to_name: Dict[str, str]) -> L
 
 def inject_exchanges(sysml_text: str, exchanges: List[Exchange]) -> str:
     """Return the SysML text augmented with port usages, port defs, interface defs, and connection defs."""
-    # Get the mapping from part IDs to their type names
     part_id_to_name = get_part_id_to_name_map(sysml_text)
-
     part_ports = _build_part_ports(exchanges, part_id_to_name)
 
     existing_port_usages: Set[str] = set(re.findall(r"\bport\s+(\w+)\s*:", sysml_text))
@@ -341,7 +334,6 @@ def inject_exchanges(sysml_text: str, exchanges: List[Exchange]) -> str:
         id_match = re.search(r"/\* ID: ([0-9a-f-]+) \*/", line)
         if id_match:
             part_id = id_match.group(1)
-            # Find the part name that matches this ID
             matched_part_name = None
             for pid, pname in part_id_to_name.items():
                 if pid == part_id:
@@ -362,13 +354,20 @@ def inject_exchanges(sysml_text: str, exchanges: List[Exchange]) -> str:
     # --- Append port defs, interface defs, and connection defs at package level ---
     append_lines: List[str] = []
 
+    # Two port defs per exchange (source-component-specific and target-component-specific)
     for exch in exchanges:
         exch_name = to_exchange_name(exch.exchange_name)
-        port_def_name = f"{exch_name}ConnectionPoint"
-        if port_def_name not in existing_port_defs:
-            existing_port_defs.add(port_def_name)
-            append_lines.append(f"{INDENT}port def {port_def_name};")
-            append_lines.append("")
+        from_suffix = to_component_suffix(exch.from_part_name)
+        to_suffix = to_component_suffix(exch.to_part_name)
+
+        for pd in [
+            f"{exch_name}ConnectionPoint_{from_suffix}",
+            f"{exch_name}ConnectionPoint_{to_suffix}",
+        ]:
+            if pd not in existing_port_defs:
+                existing_port_defs.add(pd)
+                append_lines.append(f"{INDENT}port def {pd};")
+                append_lines.append("")
 
     for exch in exchanges:
         iface_name = f"{to_exchange_name(exch.exchange_name)}_Interface"

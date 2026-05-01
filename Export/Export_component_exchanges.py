@@ -3,8 +3,11 @@
 export_component_exchanges_to_excel.py
 Exports component exchanges from a SysML v2 file to an Excel file.
 Properly extracts port IDs and applies naming conventions:
+- Part names: Remove ID suffix and convert PascalCase to space-separated words
 - Port names: CP1_9b89 -> CP 1 (exclude after _, add space between letters/numbers)
 - Exchange names: EW_HST_HTML -> EW - HST - HTML (underscores to hyphen-space)
+- For uppercase sequences followed by lowercase: DVSTeam -> DVS Team
+- For lowercase followed by uppercase: GroundStation -> Ground Station
 """
 
 import pathlib
@@ -16,33 +19,80 @@ import openpyxl
 from openpyxl.styles import PatternFill
 
 def from_pascal_case(name: str) -> str:
-    """Convert PascalCase to space-separated words with proper handling of acronyms."""
+    """
+    Convert PascalCase to space-separated words with proper handling of acronyms.
+    Rules:
+    1. First remove ID suffix (underscore and 4 hex chars) if present
+    2. For CODE-prefixed names: split each capital letter with spaces
+    3. For uppercase sequences followed by lowercase: add space between last two uppercase letters
+       - DVSTeam -> DVS Team
+       - AIVTeam -> AIV Team
+    4. For lowercase followed by uppercase: add space before uppercase letter
+       - GroundStation -> Ground Station
+    """
     if not name:
         return name
-    if name.isupper():
-        return name
-    result = []
-    i = 0
-    n = len(name)
+
+    # Remove ID suffix if present (underscore followed by 4 hex characters)
+    name_without_id = re.sub(r'_[0-9a-f]{4}$', '', name)
+
+    # Special handling for CODE prefix
+    if name_without_id.startswith('CODE'):
+        # Split CODE and the rest
+        code_part = 'CODE'
+        rest_part = name_without_id[4:]
+
+        # Process the rest part by adding space before each uppercase letter
+        processed_rest = []
+        for i, char in enumerate(rest_part):
+            if char.isupper() and i > 0:
+                processed_rest.append(' ')
+            processed_rest.append(char)
+        return f"{code_part} {''.join(processed_rest)}".strip()
+
+    # General case for all other names
+    result = [name_without_id[0]]
+
+    i = 1
+    n = len(name_without_id)
+
     while i < n:
-        if name[i].isupper():
-            j = i
-            while j < n and name[j].isupper():
-                j += 1
-            if j == n:
-                result.append(name[i:j])
-                i = j
-            elif j < n and name[j].islower():
-                result.append(name[i:j-1])
-                result.append(" " + name[j-1])
-                i = j
+        char = name_without_id[i]
+        prev_char = name_without_id[i-1]
+
+        # Check if current character is uppercase
+        if char.isupper():
+            # Check if previous character is lowercase
+            if prev_char.islower():
+                # Add space before this uppercase letter
+                result.append(' ')
+                result.append(char)
+                i += 1
             else:
-                result.append(name[i:j])
-                i = j
+                # Previous character is uppercase - we're in an uppercase sequence
+                # Look ahead to see if this sequence is followed by lowercase
+                j = i
+                while j < n and name_without_id[j].isupper():
+                    j += 1
+
+                if j < n and name_without_id[j].islower():
+                    # This is an uppercase sequence followed by lowercase
+                    # Add all but the last uppercase letter
+                    result.append(name_without_id[i:j-1])
+                    # Add space and the last uppercase letter
+                    result.append(' ')
+                    result.append(name_without_id[j-1])
+                    i = j
+                else:
+                    # This is an uppercase sequence at the end or followed by another uppercase
+                    result.append(char)
+                    i += 1
         else:
-            result.append(name[i])
+            # Lowercase letter - just add it
+            result.append(char)
             i += 1
-    return "".join(result).replace("  ", " ").strip()
+
+    return ''.join(result)
 
 def format_port_name(port_name: str) -> str:
     """Convert port name like CP1_9b89 to CP 1 (exclude after _, add space between letters/numbers)."""
@@ -192,10 +242,12 @@ def export_to_excel(connections: List[Dict], output_path: pathlib.Path) -> None:
         formatted_from_port_name = format_port_name(conn["from_port_name"])
         formatted_to_port_name = format_port_name(conn["to_port_name"])
         formatted_exchange_name = format_exchange_name(conn["conn_name"])
+        formatted_from_part_name = from_pascal_case(conn["from_part_name"])
+        formatted_to_part_name = from_pascal_case(conn["to_part_name"])
 
         # From part and port
         ws.cell(row=new_row, column=1, value=conn["from_part_id"])
-        ws.cell(row=new_row, column=2, value=from_pascal_case(conn["from_part_name"]))
+        ws.cell(row=new_row, column=2, value=formatted_from_part_name)
         ws.cell(row=new_row, column=3, value=conn["from_port_id"])
         ws.cell(row=new_row, column=4, value=formatted_from_port_name)  # Formatted port name
         ws.cell(row=new_row, column=5, value="")  # Direction - leave empty
@@ -208,7 +260,7 @@ def export_to_excel(connections: List[Dict], output_path: pathlib.Path) -> None:
 
         # To part and port
         ws.cell(row=new_row, column=10, value=conn["to_part_id"])
-        ws.cell(row=new_row, column=11, value=from_pascal_case(conn["to_part_name"]))
+        ws.cell(row=new_row, column=11, value=formatted_to_part_name)
         ws.cell(row=new_row, column=12, value=conn["to_port_id"])
         ws.cell(row=new_row, column=13, value=formatted_to_port_name)  # Formatted port name
         ws.cell(row=new_row, column=14, value="")  # Direction - leave empty
@@ -257,8 +309,8 @@ def main() -> None:
         # Print debug info for verification
         for i, conn in enumerate(connections, 1):
             print(f"\nConnection {i}: {format_exchange_name(conn['conn_name'])}")
-            print(f"  From: {conn['from_part_name']}.{format_port_name(conn['from_port_name'])} (ID: {conn['from_part_id']}, Port ID: {conn['from_port_id']})")
-            print(f"  To:   {conn['to_part_name']}.{format_port_name(conn['to_port_name'])} (ID: {conn['to_part_id']}, Port ID: {conn['to_port_id']})")
+            print(f"  From: {from_pascal_case(conn['from_part_name'])}.{format_port_name(conn['from_port_name'])} (ID: {conn['from_part_id']}, Port ID: {conn['from_port_id']})")
+            print(f"  To:   {from_pascal_case(conn['to_part_name'])}.{format_port_name(conn['to_port_name'])} (ID: {conn['to_part_id']}, Port ID: {conn['to_port_id']})")
 
     export_to_excel(connections, output_path)
 

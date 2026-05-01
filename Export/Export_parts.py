@@ -3,6 +3,12 @@
 export_parts_to_excel.py
 Exports parts from a SysML v2 file to an Excel file with proper hierarchical structure.
 Each system is immediately followed by its subsystems in the Excel file.
+Now excludes the ID suffix (underscore and first 4 ID characters) from exported names.
+Improved name conversion to match import behavior:
+- "HighSchoolTeacher" -> "High School Teacher"
+- "AIVTeam" -> "AIV Team"
+- "EPS" -> "EPS"
+- "CODETest1" -> "CODE Test 1"
 """
 
 import pathlib
@@ -14,33 +20,68 @@ import openpyxl
 from openpyxl.styles import PatternFill
 
 def from_pascal_case(name: str) -> str:
-    """Convert PascalCase to space-separated words with proper handling of acronyms."""
+    """
+    Convert PascalCase to space-separated words with proper handling of acronyms.
+    Rules:
+    1. First letter is always kept as start of first word
+    2. For subsequent uppercase letters:
+       - If followed by lowercase: add space before the letter (e.g., "School" in "HighSchool")
+       - If in a sequence of uppercase letters: add space before the last letter (e.g., "AIV" in "AIVTeam")
+    3. Remove ID suffix if present (underscore followed by 4 hex characters)
+    """
     if not name:
         return name
-    if name.isupper():
-        return name
-    result = []
-    i = 0
-    n = len(name)
+
+    # Remove ID suffix if present (underscore followed by 4 hex characters)
+    name_without_id = re.sub(r'_[0-9a-f]{4}$', '', name)
+
+    # If the name is all uppercase, return as-is
+    if name_without_id.isupper():
+        return name_without_id
+
+    # Handle special case: single word with no uppercase after first letter
+    if len(name_without_id) == 1:
+        return name_without_id
+
+    result = [name_without_id[0].upper()]
+
+    i = 1
+    n = len(name_without_id)
+
     while i < n:
-        if name[i].isupper():
-            j = i
-            while j < n and name[j].isupper():
-                j += 1
-            if j == n:
-                result.append(name[i:j])
-                i = j
-            elif j < n and name[j].islower():
-                result.append(name[i:j-1])
-                result.append(" " + name[j-1])
-                i = j
+        # Check if current character is uppercase
+        if name_without_id[i].isupper():
+            # Look ahead to see if next character is lowercase
+            if i + 1 < n and name_without_id[i+1].islower():
+                # This is the start of a new word (e.g., "School" in "HighSchool")
+                result.append(' ')
+                result.append(name_without_id[i].upper())
+                i += 1
             else:
-                result.append(name[i:j])
+                # This is part of an acronym sequence (e.g., "AIV" in "AIVTeam")
+                # Find the end of the uppercase sequence
+                j = i
+                while j < n and name_without_id[j].isupper():
+                    j += 1
+
+                # Add space before the last uppercase letter if followed by lowercase
+                if j < n and name_without_id[j].islower():
+                    # Add all but last uppercase letter
+                    result.append(name_without_id[i:j-1])
+                    result.append(' ')
+                    result.append(name_without_id[j-1].upper())
+                else:
+                    # All uppercase at end, add as-is
+                    result.append(name_without_id[i:j])
+
                 i = j
         else:
-            result.append(name[i])
+            # Lowercase letter - just add it
+            result.append(name_without_id[i])
             i += 1
-    return "".join(result).replace("  ", " ").strip()
+
+    # Join all parts and clean up
+    return ''.join(result).replace('  ', ' ').strip()
 
 def extract_id_from_text(text: str) -> str:
     """Extract ID from text using the pattern: /* ID: uuid */"""
@@ -105,10 +146,11 @@ def parse_parts_file(file_path: pathlib.Path) -> tuple:
 
     top_level_parts = [name for name in part_defs if name not in all_used_types]
 
-    # If LogicalSystem exists, make it the first top-level part
-    if 'LogicalSystem' in top_level_parts:
-        top_level_parts.remove('LogicalSystem')
-        top_level_parts.insert(0, 'LogicalSystem')
+    # If LogicalSystem exists (with or without ID suffix), make it the first top-level part
+    logical_system_variants = [name for name in top_level_parts if name.startswith('LogicalSystem')]
+    if logical_system_variants:
+        top_level_parts.remove(logical_system_variants[0])
+        top_level_parts.insert(0, logical_system_variants[0])
 
     # Build the complete hierarchy
     parts = []
@@ -132,8 +174,19 @@ def parse_parts_file(file_path: pathlib.Path) -> tuple:
 
     return parts, part_defs
 
+def remove_id_suffix(name: str) -> str:
+    """
+    Remove the ID suffix (underscore and first 4 ID characters) from a name if present.
+    Example: "EPS_cc31" -> "EPS"
+             "LogicalSystem_e9b6" -> "LogicalSystem"
+             "StoreEnergyInTheBatteries_baf4" -> "StoreEnergyInTheBatteries"
+    """
+    return re.sub(r'_[0-9a-f]{4}$', '', name)
+
 def export_parts_to_excel(parts: List[Dict], part_defs: Dict, output_path: pathlib.Path) -> None:
-    """Export all parts to an Excel file with hierarchical structure."""
+    """Export all parts to an Excel file with hierarchical structure.
+    Now exports names without the ID suffix and with proper spacing.
+    """
     output_path.parent.mkdir(parents=True, exist_ok=True)
     wb = openpyxl.Workbook()
 
@@ -161,13 +214,16 @@ def export_parts_to_excel(parts: List[Dict], part_defs: Dict, output_path: pathl
     for part in parts:
         new_row = ws.max_row + 1
 
+        # Format the name without ID suffix for export
+        display_name = from_pascal_case(remove_id_suffix(part['name']))
+
         # Fill in all columns for this part's level and above
         for level in range(part['level'] + 1):
             col = 1 + (level * 3)
             if level == part['level']:
-                # This is our current level - fill ID and name
+                # This is our current level - fill ID and name (without ID suffix)
                 ws.cell(row=new_row, column=col, value=part['id'])
-                ws.cell(row=new_row, column=col+1, value=from_pascal_case(part['name']))
+                ws.cell(row=new_row, column=col+1, value=display_name)
             else:
                 # Higher levels - leave empty (will be filled by parent)
                 pass
@@ -186,7 +242,6 @@ def export_parts_to_excel(parts: List[Dict], part_defs: Dict, output_path: pathl
         ws.column_dimensions[column_letter].width = adjusted_width
 
     wb.save(output_path)
-    print(f"Exported {len(parts)} parts to: {output_path}")
 
 def main() -> None:
     _DVS_DIR = pathlib.Path(__file__).parent.parent
@@ -215,7 +270,7 @@ def main() -> None:
         # Print hierarchy for verification
         for part in parts:
             indent = "  " * part['level']
-            print(f"{indent}{part['name']} (Level {part['level']}, ID: {part['id']})")
+            print(f"{indent}{from_pascal_case(remove_id_suffix(part['name']))} (Level {part['level']}, ID: {part['id']})")
 
     export_parts_to_excel(parts, part_defs, output_path)
 

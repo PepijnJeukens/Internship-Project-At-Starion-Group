@@ -4,6 +4,7 @@ export_functions_to_excel.py
 Exports functions from a SysML v2 file to an Excel file with hierarchical structure.
 Uses text parsing to avoid syside import issues.
 Each function is exported only once at its correct hierarchy level.
+Now removes ID suffix and properly handles spacing for all function names.
 """
 
 import pathlib
@@ -15,32 +16,46 @@ import openpyxl
 from openpyxl.styles import PatternFill
 
 def from_pascal_case(name: str) -> str:
-    """Convert PascalCase to space-separated words with proper handling of acronyms."""
+    """
+    Convert PascalCase to space-separated words with proper handling of acronyms.
+    Rules:
+    1. First remove ID suffix (underscore and 4 hex chars) if present
+    2. For CODE-prefixed names: split each capital letter with spaces
+    3. For all other names: add space before capital letters that follow lowercase letters
+    """
     if not name:
         return name
 
-    # Handle ALL-CAPS prefixes (like CODE)
-    result = []
-    i = 0
-    n = len(name)
+    # Remove ID suffix if present (underscore followed by 4 hex characters)
+    name_without_id = re.sub(r'_[0-9a-f]{4}$', '', name)
 
-    # Check for ALL-CAPS prefix
-    while i < n and name[i].isupper():
-        j = i
-        while j < n and name[j].isupper():
-            j += 1
-        if j > i:
-            result.append(name[i:j])
-            i = j
+    # Special handling for CODE prefix
+    if name_without_id.startswith('CODE'):
+        # Split CODE and the rest
+        code_part = 'CODE'
+        rest_part = name_without_id[4:]
 
-    # Process the rest of the string
-    while i < n:
-        if name[i].isupper() and i > 0 and not name[i-1].isupper():
-            result.append(" ")
-        result.append(name[i])
-        i += 1
+        # Process the rest part by adding space before each uppercase letter
+        processed_rest = []
+        for i, char in enumerate(rest_part):
+            if char.isupper() and i > 0:
+                processed_rest.append(' ')
+            processed_rest.append(char)
+        return f"{code_part} {''.join(processed_rest)}".strip()
 
-    return "".join(result).strip()
+    # General case for all other names
+    result = [name_without_id[0]]
+
+    for i in range(1, len(name_without_id)):
+        char = name_without_id[i]
+        prev_char = name_without_id[i-1]
+
+        # Add space before uppercase letters that follow lowercase letters
+        if char.isupper() and prev_char.islower():
+            result.append(' ')
+        result.append(char)
+
+    return ''.join(result)
 
 def extract_id_from_text(text: str) -> str:
     """Extract ID from text using the pattern: /* ID: uuid */"""
@@ -127,8 +142,17 @@ def parse_functions_file(file_path: pathlib.Path) -> List[Dict]:
 
     return functions
 
+def remove_id_suffix(name: str) -> str:
+    """
+    Remove the ID suffix (underscore and first 4 ID characters) from a name if present.
+    Example: "PrepareEducationalSpaceExperiment_83c0" -> "PrepareEducationalSpaceExperiment"
+    """
+    return re.sub(r'_[0-9a-f]{4}$', '', name)
+
 def export_functions_to_excel(functions: List[Dict], output_path: pathlib.Path) -> None:
-    """Export all functions to an Excel file with hierarchical structure."""
+    """Export all functions to an Excel file with hierarchical structure.
+    Now exports names without the ID suffix and with proper spacing.
+    """
     output_path.parent.mkdir(parents=True, exist_ok=True)
     wb = openpyxl.Workbook()
 
@@ -156,13 +180,16 @@ def export_functions_to_excel(functions: List[Dict], output_path: pathlib.Path) 
     for func in functions:
         new_row = ws.max_row + 1
 
+        # Format the name without ID suffix for export
+        display_name = from_pascal_case(remove_id_suffix(func['name']))
+
         # Fill in all columns for this function's level and above
         for level in range(func['level'] + 1):
             col = 1 + (level * 3)
             if level == func['level']:
                 # This is our current level - fill ID and name
                 ws.cell(row=new_row, column=col, value=func['id'])
-                ws.cell(row=new_row, column=col+1, value=from_pascal_case(func['name']))
+                ws.cell(row=new_row, column=col+1, value=display_name)
                 # Leave kind column empty as requested
             else:
                 # Higher levels - leave empty (will be filled by parent)
@@ -211,7 +238,7 @@ def main() -> None:
         # Print hierarchy for verification
         for func in functions:
             indent = "  " * func['level']
-            print(f"{indent}{func['name']} (Level {func['level']}, ID: {func['id']})")
+            print(f"{indent}{from_pascal_case(remove_id_suffix(func['name']))} (Level {func['level']}, ID: {func['id']})")
 
     export_functions_to_excel(functions, output_path)
 

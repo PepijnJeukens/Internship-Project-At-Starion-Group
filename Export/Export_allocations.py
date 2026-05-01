@@ -3,6 +3,7 @@
 export_allocations_to_excel.py
 Exports function allocations from SysML v2 files to an Excel file with proper hierarchical structure.
 Each system is followed by its allocated functions in the Excel file.
+Now removes ID suffix and follows the same naming convention as parts and functions exports.
 """
 
 import pathlib
@@ -14,33 +15,46 @@ import openpyxl
 from openpyxl.styles import PatternFill
 
 def from_pascal_case(name: str) -> str:
-    """Convert PascalCase to space-separated words with proper handling of acronyms."""
+    """
+    Convert PascalCase to space-separated words with proper handling of acronyms.
+    Rules:
+    1. First remove ID suffix (underscore and 4 hex chars) if present
+    2. For CODE-prefixed names: split each capital letter with spaces
+    3. For all other names: add space before capital letters that follow lowercase letters
+    """
     if not name:
         return name
-    if name.isupper():
-        return name
-    result = []
-    i = 0
-    n = len(name)
-    while i < n:
-        if name[i].isupper():
-            j = i
-            while j < n and name[j].isupper():
-                j += 1
-            if j == n:
-                result.append(name[i:j])
-                i = j
-            elif j < n and name[j].islower():
-                result.append(name[i:j-1])
-                result.append(" " + name[j-1])
-                i = j
-            else:
-                result.append(name[i:j])
-                i = j
-        else:
-            result.append(name[i])
-            i += 1
-    return "".join(result).replace("  ", " ").strip()
+
+    # Remove ID suffix if present (underscore followed by 4 hex characters)
+    name_without_id = re.sub(r'_[0-9a-f]{4}$', '', name)
+
+    # Special handling for CODE prefix
+    if name_without_id.startswith('CODE'):
+        # Split CODE and the rest
+        code_part = 'CODE'
+        rest_part = name_without_id[4:]
+
+        # Process the rest part by adding space before each uppercase letter
+        processed_rest = []
+        for i, char in enumerate(rest_part):
+            if char.isupper() and i > 0:
+                processed_rest.append(' ')
+            processed_rest.append(char)
+        return f"{code_part} {''.join(processed_rest)}".strip()
+
+    # General case for all other names
+    result = [name_without_id[0]]
+
+    for i in range(1, len(name_without_id)):
+        char = name_without_id[i]
+        prev_char = name_without_id[i-1]
+
+        # Add space before uppercase letters that follow lowercase letters
+        if char.isupper() and prev_char.islower():
+            result.append(' ')
+        result.append(char)
+
+    return ''.join(result)
 
 def extract_id_from_text(text: str) -> str:
     """Extract ID from text using the pattern: /* ID: uuid */"""
@@ -94,7 +108,9 @@ def parse_parts_file(file_path: pathlib.Path) -> Dict[str, Dict]:
         allocated_functions = []
         for perform_match in re.finditer(r'perform action (\w+)\s*:\s*(\w+)\s*\{', content_block):
             usage_name, function_type = perform_match.groups()
-            function_id = extract_id_from_text(content_block[perform_match.end():])
+            # Extract ID from the perform action block
+            perform_block = content_block[perform_match.end():]
+            function_id = extract_id_from_text(perform_block)
             allocated_functions.append({
                 'name': function_type,
                 'id': function_id,
@@ -154,10 +170,11 @@ def build_allocation_hierarchy(part_defs: Dict[str, Dict]) -> List[Dict]:
 
     top_level_parts = [name for name in part_defs if name not in all_used_types]
 
-    # If LogicalSystem exists, make it the first top-level part
-    if 'LogicalSystem' in top_level_parts:
-        top_level_parts.remove('LogicalSystem')
-        top_level_parts.insert(0, 'LogicalSystem')
+    # If LogicalSystem exists (with or without ID suffix), make it the first top-level part
+    logical_system_variants = [name for name in top_level_parts if name.startswith('LogicalSystem')]
+    if logical_system_variants:
+        top_level_parts.remove(logical_system_variants[0])
+        top_level_parts.insert(0, logical_system_variants[0])
 
     result = []
     for top_part_name in top_level_parts:
@@ -296,9 +313,9 @@ def main() -> None:
         for item in allocation_hierarchy:
             indent = "  " * item['level']
             if item['type'] == 'part':
-                print(f"{indent}{item['name']} (System, Level {item['level']}, ID: {item['id']})")
+                print(f"{indent}{from_pascal_case(item['name'])} (System, Level {item['level']}, ID: {item['id']})")
             else:
-                print(f"{indent}{item['name']} (Function, Level {item['level']}, ID: {item['id']})")
+                print(f"{indent}{from_pascal_case(item['name'])} (Function, Level {item['level']}, ID: {item['id']})")
 
     export_allocations_to_excel(allocation_hierarchy, output_path)
 
