@@ -104,9 +104,9 @@ def main() -> None:
     # Define your file paths directly here
     data_dir = script_dir / "Data"  # Assuming your files are in a Data subdirectory
 
-    file1_path = data_dir / "TestExport_complete_export.xlsx"
-    file2_path = data_dir / "DVS_complete_export.xlsx"
-    output_path = data_dir / "Comparison_Result.xlsx"  # Output file path
+    file1_path = data_dir / "small_complete_export.xlsx"
+    file2_path = data_dir / "Small_sysml_complete_export.xlsx"
+    output_path = data_dir / "Comparison_small_Result.xlsx"  # Output file path
 
     # Verify files exist
     if not file1_path.exists():

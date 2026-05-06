@@ -1584,28 +1584,47 @@ def import_exchange_allocations(rows: List[tuple], parts_path) -> None:
 # ===========================================================================
 
 @dataclass
+class ChainExchange:
+    exchange_id: str
+    exchange_name: str
+    involvement_id: str
+    source_function_id: str
+    source_function_name: str
+    target_function_id: str
+    target_function_name: str
+
+
+@dataclass
 class FunctionalChain:
     chain_id: str
     chain_name: str
-    start_function_id: str
-    start_function_name: str
-    end_function_id: str
-    end_function_name: str
     function_ids: List[str] = field(default_factory=list)
     function_names: List[str] = field(default_factory=list)
-    exchange_ids: List[str] = field(default_factory=list)
-    exchange_names: List[str] = field(default_factory=list)
+    exchanges: list = field(default_factory=list)  # List[ChainExchange]
 
 
-def _detect_chain_column_groups(header: tuple) -> Tuple[List[Tuple[int, int]], List[Tuple[int, int]]]:
-    """Detect function and exchange column groups from a functional-chains header row."""
-    function_cols: List[Tuple[int, int]] = []
-    exchange_cols: List[Tuple[int, int]] = []
+def _detect_chain_column_groups(
+    header: tuple,
+) -> Tuple[List[Tuple[int, int, int]], List[Tuple[int, int, int, int, int, int, int]]]:
+    """Detect function and exchange column groups from the functional-chains header.
+
+    Functions: "Function N ID", "Function N Name", "Function N Involvement ID"
+    Exchanges: "Exchange N ID", "Exchange N Name", "Exchange N Involvement ID",
+               "Exchange N Source Function ID", "Exchange N Source Function Name",
+               "Exchange N Target Function ID", "Exchange N Target Function Name"
+    """
+    h = list(header)
+    function_cols: List[Tuple[int, int, int]] = []
+    exchange_cols: List[Tuple[int, int, int, int, int, int, int]] = []
 
     n = 1
     while True:
         try:
-            function_cols.append((header.index(f"Function {n} ID"), header.index(f"Function {n} Name")))
+            function_cols.append((
+                h.index(f"Function {n} ID"),
+                h.index(f"Function {n} Name"),
+                h.index(f"Function {n} Involvement ID"),
+            ))
             n += 1
         except ValueError:
             break
@@ -1613,7 +1632,15 @@ def _detect_chain_column_groups(header: tuple) -> Tuple[List[Tuple[int, int]], L
     n = 1
     while True:
         try:
-            exchange_cols.append((header.index(f"Exchange {n} ID"), header.index(f"Exchange {n} Name")))
+            exchange_cols.append((
+                h.index(f"Exchange {n} ID"),
+                h.index(f"Exchange {n} Name"),
+                h.index(f"Exchange {n} Involvement ID"),
+                h.index(f"Exchange {n} Source Function ID"),
+                h.index(f"Exchange {n} Source Function Name"),
+                h.index(f"Exchange {n} Target Function ID"),
+                h.index(f"Exchange {n} Target Function Name"),
+            ))
             n += 1
         except ValueError:
             break
@@ -1627,51 +1654,61 @@ def _parse_chain_rows(rows: List[tuple]) -> List[FunctionalChain]:
         return []
 
     header = rows[0]
-    function_cols, exchange_cols = _detect_chain_column_groups(header)
-
-    if not function_cols:
-        print("Warning: no 'Function N ID/Name' columns found in header.", file=sys.stderr)
-    if not exchange_cols:
-        print("Warning: no 'Exchange N ID/Name' columns found in header.", file=sys.stderr)
-
-    print(f"Detected: {len(function_cols)} function column group(s), {len(exchange_cols)} exchange column group(s)")
 
     try:
         chain_id_col = header.index("Functional Chain ID")
         chain_name_col = header.index("Functional Chain Name")
-        start_fn_id_col = header.index("Start Function ID")
-        start_fn_name_col = header.index("Start Function Name")
-        end_fn_id_col = header.index("End Function ID")
-        end_fn_name_col = header.index("End Function Name")
     except ValueError as exc:
         print(f"Error: required column not found in header: {exc}", file=sys.stderr)
         return []
+
+    function_cols, exchange_cols = _detect_chain_column_groups(header)
+
+    if not function_cols:
+        print("Warning: no 'Function N ID/Name/Involvement ID' column groups found.", file=sys.stderr)
+    if not exchange_cols:
+        print("Warning: no 'Exchange N ...' column groups found.", file=sys.stderr)
+
+    print(f"Detected: {len(function_cols)} function column group(s), {len(exchange_cols)} exchange column group(s)")
 
     chains: List[FunctionalChain] = []
     for row in rows[1:]:
         if not any(row):
             continue
+        row = list(row) + [None] * 10
         chain_id = row[chain_id_col]
         chain_name = row[chain_name_col]
         if not chain_id or not chain_name:
             continue
 
-        function_ids = [str(row[ic]).strip() for ic, nc in function_cols if row[ic]]
-        function_names = [str(row[nc]).strip() if row[nc] else "" for ic, nc in function_cols if row[ic]]
-        exchange_ids = [str(row[ic]).strip() for ic, nc in exchange_cols if row[ic]]
-        exchange_names = [str(row[nc]).strip() if row[nc] else "" for ic, nc in exchange_cols if row[ic]]
+        function_ids = []
+        function_names = []
+        for id_col, name_col, _invol_col in function_cols:
+            if row[id_col]:
+                function_ids.append(str(row[id_col]).strip())
+                function_names.append(str(row[name_col]).strip() if row[name_col] else "")
+
+        exchanges = []
+        for (ex_id_col, ex_name_col, ex_invol_col,
+             src_fn_id_col, src_fn_name_col,
+             tgt_fn_id_col, tgt_fn_name_col) in exchange_cols:
+            if row[ex_id_col]:
+                exchanges.append(ChainExchange(
+                    exchange_id=str(row[ex_id_col]).strip(),
+                    exchange_name=str(row[ex_name_col]).strip() if row[ex_name_col] else "",
+                    involvement_id=str(row[ex_invol_col]).strip() if row[ex_invol_col] else "",
+                    source_function_id=str(row[src_fn_id_col]).strip() if row[src_fn_id_col] else "",
+                    source_function_name=str(row[src_fn_name_col]).strip() if row[src_fn_name_col] else "",
+                    target_function_id=str(row[tgt_fn_id_col]).strip() if row[tgt_fn_id_col] else "",
+                    target_function_name=str(row[tgt_fn_name_col]).strip() if row[tgt_fn_name_col] else "",
+                ))
 
         chains.append(FunctionalChain(
             chain_id=str(chain_id).strip(),
             chain_name=str(chain_name).strip(),
-            start_function_id=str(row[start_fn_id_col]).strip() if row[start_fn_id_col] else "",
-            start_function_name=str(row[start_fn_name_col]).strip() if row[start_fn_name_col] else "",
-            end_function_id=str(row[end_fn_id_col]).strip() if row[end_fn_id_col] else "",
-            end_function_name=str(row[end_fn_name_col]).strip() if row[end_fn_name_col] else "",
             function_ids=function_ids,
             function_names=function_names,
-            exchange_ids=exchange_ids,
-            exchange_names=exchange_names,
+            exchanges=exchanges,
         ))
 
     return chains
@@ -1682,6 +1719,155 @@ def load_chains(path: pathlib.Path, sheet_name: Optional[str] = None) -> List[Fu
     wb = openpyxl.load_workbook(path, data_only=True)
     ws = wb[sheet_name] if sheet_name else wb.active
     return _parse_chain_rows(list(ws.iter_rows(values_only=True)))
+
+
+def _fc_find_join(
+    branch_starts: List[str],
+    outgoing: Dict[str, List[str]],
+) -> Optional[str]:
+    """Return the nearest successor reachable from all branch_starts (join point), or None."""
+    if not branch_starts:
+        return None
+
+    def reachable(start: str) -> Set[str]:
+        visited: Set[str] = set()
+        queue = [start]
+        while queue:
+            node = queue.pop(0)
+            if node in visited:
+                continue
+            visited.add(node)
+            queue.extend(outgoing.get(node, []))
+        return visited
+
+    common = reachable(branch_starts[0])
+    for s in branch_starts[1:]:
+        common &= reachable(s)
+
+    if not common:
+        return None
+
+    # BFS from first branch start; return the first common node encountered
+    queue = [branch_starts[0]]
+    seen: Set[str] = set()
+    while queue:
+        node = queue.pop(0)
+        if node in seen:
+            continue
+        seen.add(node)
+        if node in common:
+            return node
+        queue.extend(outgoing.get(node, []))
+
+    return None
+
+
+def _fc_path_to(
+    start: str,
+    end: Optional[str],
+    outgoing: Dict[str, List[str]],
+) -> List[str]:
+    """Walk the graph linearly from start up to (but not including) end."""
+    path: List[str] = []
+    current: Optional[str] = start
+    seen: Set[str] = set()
+    while current and current != end:
+        if current in seen:
+            break
+        seen.add(current)
+        path.append(current)
+        nexts = outgoing.get(current, [])
+        current = nexts[0] if len(nexts) == 1 else None
+    return path
+
+
+def _generate_chain_actions(
+    chain: FunctionalChain,
+    id_to_def_name: Dict[str, str],
+) -> List[str]:
+    """Produce ordered 'then action' lines (with if/else/fork) for a functional chain.
+
+    Builds a directed graph from the chain's exchanges (source → target) and
+    traverses it topologically.  Branch points (2 outgoing edges) are emitted
+    as 'a = 0; then if a > 1 { ... } else { ... }' with a 'then fork;' before
+    the convergence node when both branches share a common successor.
+    """
+    # Build id→name map; exchanges supplement the explicit function list
+    func_id_to_name: Dict[str, str] = dict(zip(chain.function_ids, chain.function_names))
+    outgoing: Dict[str, List[str]] = {}
+    incoming: Dict[str, List[str]] = {}
+
+    for ex in chain.exchanges:
+        src, tgt = ex.source_function_id, ex.target_function_id
+        if not src or not tgt:
+            continue
+        func_id_to_name.setdefault(src, ex.source_function_name)
+        func_id_to_name.setdefault(tgt, ex.target_function_name)
+        if tgt not in outgoing.setdefault(src, []):
+            outgoing[src].append(tgt)
+        if src not in incoming.setdefault(tgt, []):
+            incoming[tgt].append(src)
+
+    exchange_nodes: Set[str] = set(outgoing) | set(incoming)
+    roots = [n for n in exchange_nodes if not incoming.get(n)]
+    if not roots and chain.function_ids:
+        roots = [chain.function_ids[0]]
+
+    # Functions not appearing in any exchange are listed before graph-derived ones
+    isolated = [fid for fid in chain.function_ids if fid not in exchange_nodes]
+
+    branch_vars = iter("abcdefghijklmnopqrstuvwxyz")
+    visited: Set[str] = set()
+    lines: List[str] = []
+
+    def emit(fid: str, depth: int = 2) -> None:
+        fname = func_id_to_name.get(fid, "")
+        atype = id_to_def_name.get(fid, to_type_name(fname, fid))
+        ausage = to_usage_name(fname, fid)
+        lines.append(f"{INDENT * depth}then action {ausage} : {atype};")
+
+    def process(start_id: str) -> None:
+        current: Optional[str] = start_id
+        while current:
+            if current in visited:
+                break
+            visited.add(current)
+            emit(current, 2)
+            nexts = outgoing.get(current, [])
+            if not nexts:
+                break
+            if len(nexts) == 1:
+                current = nexts[0]
+            else:
+                var = next(branch_vars)
+                join_id = _fc_find_join(nexts, outgoing)
+                lines.append(f"{INDENT * 2}{var} = 0;")
+                lines.append(f"{INDENT * 2}then if {var} > 1 {{")
+                for bfid in _fc_path_to(nexts[0], join_id, outgoing):
+                    visited.add(bfid)
+                    emit(bfid, 3)
+                lines.append(f"{INDENT * 2}}}")
+                lines.append(f"{INDENT * 2}else {{")
+                for bfid in _fc_path_to(nexts[1], join_id, outgoing):
+                    visited.add(bfid)
+                    emit(bfid, 3)
+                lines.append(f"{INDENT * 2}}}")
+                if join_id:
+                    lines.append(f"{INDENT * 2}then fork;")
+                    current = join_id
+                else:
+                    break
+
+    for fid in isolated:
+        if fid not in visited:
+            visited.add(fid)
+            emit(fid, 2)
+
+    for root in roots:
+        if root not in visited:
+            process(root)
+
+    return lines
 
 
 def inject_chains(sysml_text: str, chains: List[FunctionalChain]) -> str:
@@ -1698,22 +1884,18 @@ def inject_chains(sysml_text: str, chains: List[FunctionalChain]) -> str:
             continue
         existing_names.add(chain_type)
 
-        lines = [
+        action_lines = _generate_chain_actions(chain, id_to_def_name)
+
+        block = [
             f"{INDENT}action def {chain_type} {{",
             f"{INDENT * 2}doc",
             f"{INDENT * 2}/* ID: {chain.chain_id} */",
+            f"{INDENT * 2}first start;",
         ]
-        if chain.exchange_names:
-            exchange_type_names = [to_type_name(n) for n in chain.exchange_names if n]
-            lines.append(f"{INDENT * 2}/* Exchanges: {', '.join(exchange_type_names)} */")
-        lines.append(f"{INDENT * 2}first start;")
-        for func_id, func_name in zip(chain.function_ids, chain.function_names):
-            action_type = id_to_def_name.get(func_id, to_type_name(func_name, func_id))
-            action_usage = to_usage_name(func_name, func_id)
-            lines.append(f"{INDENT * 2}then action {action_usage} : {action_type};")
-        lines.append(f"{INDENT}}}")
-        lines.append("")
-        append_lines.extend(lines)
+        block.extend(action_lines)
+        block.append(f"{INDENT}}}")
+        block.append("")
+        append_lines.extend(block)
 
     if not append_lines:
         return sysml_text

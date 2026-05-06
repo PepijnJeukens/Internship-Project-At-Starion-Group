@@ -853,71 +853,202 @@ class FunctionalChain:
     chain_id: str
     chain_type: str
     function_types: List[str] = field(default_factory=list)
-    exchange_types: List[str] = field(default_factory=list)
+    exchanges: List[Dict] = field(default_factory=list)
+
+
+def _parse_chain_actions_from_body(body: str) -> List[Dict]:
+    """Parse a chain action def body into ordered action items.
+
+    Returns list of {'type': action_type_name, 'ctx': 'main'|'if'|'else'}.
+    Handles the generated if/else/fork pattern.
+    """
+    items: List[Dict] = []
+    state = 'main'  # 'main', 'if', 'pending_else', 'else'
+
+    for raw_line in body.split('\n'):
+        s = raw_line.strip()
+        if not s:
+            continue
+
+        if re.match(r'^then if .+\{$', s):
+            state = 'if'
+        elif s == '}':
+            if state == 'if':
+                state = 'pending_else'
+            elif state == 'else':
+                state = 'main'
+        elif re.match(r'^else\s*\{', s) and state == 'pending_else':
+            state = 'else'
+        else:
+            m = re.match(r'then action \w+\s*:\s*(\w+)\s*;', s)
+            if m:
+                ctx = 'if' if state == 'if' else ('else' if state == 'else' else 'main')
+                items.append({'type': m.group(1), 'ctx': ctx})
+
+    return items
+
+
+def _build_chain_edges(items: List[Dict]) -> List[Tuple[str, str]]:
+    """Build (source_type, target_type) pairs from an ordered action item list.
+
+    Handles linear sequences and branches (if/else groups).
+    The "active tails" — the last action(s) before the next segment — are tracked
+    so that branch convergences produce edges from both branches to the join node.
+    """
+    edges: List[Tuple[str, str]] = []
+    last_mains: List[str] = []
+    i = 0
+    n = len(items)
+
+    while i < n:
+        ctx = items[i]['ctx']
+
+        if ctx == 'main':
+            for last in last_mains:
+                edges.append((last, items[i]['type']))
+            last_mains = [items[i]['type']]
+            i += 1
+
+        elif ctx == 'if':
+            # Collect the full if-branch then the full else-branch
+            if_items: List[str] = []
+            while i < n and items[i]['ctx'] == 'if':
+                if_items.append(items[i]['type'])
+                i += 1
+            else_items: List[str] = []
+            while i < n and items[i]['ctx'] == 'else':
+                else_items.append(items[i]['type'])
+                i += 1
+
+            # Edges from each active tail to the first item of each branch
+            for last in last_mains:
+                if if_items:
+                    edges.append((last, if_items[0]))
+                if else_items:
+                    edges.append((last, else_items[0]))
+
+            # Edges within each branch (for multi-step branches)
+            for k in range(len(if_items) - 1):
+                edges.append((if_items[k], if_items[k + 1]))
+            for k in range(len(else_items) - 1):
+                edges.append((else_items[k], else_items[k + 1]))
+
+            # New active tails are the last item of each branch
+            last_mains = []
+            if if_items:
+                last_mains.append(if_items[-1])
+            if else_items:
+                last_mains.append(else_items[-1])
+
+        else:
+            i += 1
+
+    return edges
 
 
 def _parse_functional_chains(file_path: pathlib.Path):
-    """Parse a functions SysML file and return (chains, action_ids, item_ids)."""
+    """Parse chains from a functions SysML file and return (chains, action_ids).
+
+    For each chain, the exchanges list is built by:
+      1. Parsing the chain body for the ordered action sequence (incl. branches).
+      2. Deriving source→target edges from that sequence.
+      3. Looking up the connection def for each edge to get the exchange ID/name.
+    """
     raw = file_path.read_text(encoding='utf-8')
     try:
         _, content = _get_package_content(raw, file_path)
     except ValueError as exc:
         raise ValueError(str(exc)) from exc
 
+    # action_ids: type_name → id  (regular, non-chain action defs)
     action_ids: Dict[str, str] = {}
-    chains: List[FunctionalChain] = []
+    chain_data: List[Tuple[str, str, str]] = []  # (type_name, chain_id, body)
 
     for m in re.finditer(r'action def (\w+)\s*\{', content):
         type_name = m.group(1)
         body, _ = get_block(content, m.end())
         block_id = extract_id(body)
-
         if 'first start;' in body:
-            exchange_m = re.search(r'/\*\s*Exchanges:\s*([^*]+)\*/', body)
-            exchange_types = (
-                [t.strip() for t in exchange_m.group(1).split(',') if t.strip()]
-                if exchange_m else []
-            )
-            function_types = re.findall(r'then action \w+\s*:\s*(\w+)\s*;', body)
-            chains.append(FunctionalChain(
-                chain_id=block_id,
-                chain_type=type_name,
-                function_types=function_types,
-                exchange_types=exchange_types,
-            ))
+            chain_data.append((type_name, block_id, body))
         else:
             if block_id:
                 action_ids[type_name] = block_id
 
-    item_ids: Dict[str, str] = {}
+    # item_id_to_name: exchange_id → human-readable exchange name
+    item_id_to_name: Dict[str, str] = {}
     for m in re.finditer(r'item def (\w+)\s*\{', content):
         type_name = m.group(1)
         body, _ = get_block(content, m.end())
         block_id = extract_id(body)
         if block_id:
-            item_ids[type_name] = block_id
+            item_id_to_name[block_id] = from_pascal_case(type_name)
 
-    return chains, action_ids, item_ids
+    # conn_lookup: (from_action_type, to_action_type) → exchange_id
+    # The connection def's /* ID: ... */ equals the item def ID for that exchange.
+    conn_lookup: Dict[Tuple[str, str], str] = {}
+    for m in re.finditer(r'connection def (\w+)\s*\{', content):
+        body, _ = get_block(content, m.end())
+        conn_id = extract_id(body)
+        if not conn_id:
+            continue
+        end_actions = re.findall(r'end action (\w+)\s*:\s*(\w+);', body)
+        if len(end_actions) < 2:
+            continue
+        # Generated order: first end action is the source (Out), second is target (In)
+        from_type = end_actions[0][1]
+        to_type = end_actions[1][1]
+        conn_lookup[(from_type, to_type)] = conn_id
 
+    # Build FunctionalChain objects
+    chains: List[FunctionalChain] = []
+    for type_name, chain_id, body in chain_data:
+        items = _parse_chain_actions_from_body(body)
+        function_types = [item['type'] for item in items]
+        edges = _build_chain_edges(items)
 
+        exchange_list: List[Dict] = []
+        for src_type, tgt_type in edges:
+            ex_id = conn_lookup.get((src_type, tgt_type), '')
+            exchange_list.append({
+                'exchange_id':          ex_id,
+                'exchange_name':        item_id_to_name.get(ex_id, '') if ex_id else '',
+                'involvement_id':       '',  # not stored in SysML
+                'source_function_id':   action_ids.get(src_type, ''),
+                'source_function_name': from_pascal_case(src_type),
+                'target_function_id':   action_ids.get(tgt_type, ''),
+                'target_function_name': from_pascal_case(tgt_type),
+            })
+
+        chains.append(FunctionalChain(
+            chain_id=chain_id,
+            chain_type=type_name,
+            function_types=function_types,
+            exchanges=exchange_list,
+        ))
+
+    return chains, action_ids
 
 
 def export_functional_chains(ws, functions_path: pathlib.Path) -> None:
     """Populate *ws* (Functional Chains worksheet) from Functions_generated.sysml."""
-    chains, action_ids, item_ids = _parse_functional_chains(functions_path)
+    chains, action_ids = _parse_functional_chains(functions_path)
 
     max_functions = max((len(c.function_types) for c in chains), default=0)
-    max_exchanges = max((len(c.exchange_types) for c in chains), default=0)
+    max_exchanges = max((len(c.exchanges)       for c in chains), default=0)
 
-    headers = [
-        "Functional Chain ID", "Functional Chain Name",
-        "Start Function ID", "Start Function Name",
-        "End Function ID", "End Function Name",
-    ]
+    headers = ["Functional Chain ID", "Functional Chain Name"]
     for n in range(1, max_functions + 1):
         headers += [f"Function {n} ID", f"Function {n} Name", f"Function {n} Involvement ID"]
     for n in range(1, max_exchanges + 1):
-        headers += [f"Exchange {n} ID", f"Exchange {n} Name", f"Exchange {n} Involvement ID"]
+        headers += [
+            f"Exchange {n} ID",
+            f"Exchange {n} Name",
+            f"Exchange {n} Involvement ID",
+            f"Exchange {n} Source Function ID",
+            f"Exchange {n} Source Function Name",
+            f"Exchange {n} Target Function ID",
+            f"Exchange {n} Target Function Name",
+        ]
 
     for col, header in enumerate(headers, 1):
         ws.cell(row=1, column=col, value=header)
@@ -926,26 +1057,30 @@ def export_functional_chains(ws, functions_path: pathlib.Path) -> None:
     for chain in chains:
         func_ids   = [action_ids.get(t, '') for t in chain.function_types]
         func_names = [from_pascal_case(t)   for t in chain.function_types]
-        exch_ids   = [item_ids.get(t, '')   for t in chain.exchange_types]
-        exch_names = [from_pascal_case(t)   for t in chain.exchange_types]
 
-        row_values = [
-            chain.chain_id, from_pascal_case(chain.chain_type),
-            func_ids[0]  if func_ids  else '', func_names[0]  if func_names else '',
-            func_ids[-1] if func_ids  else '', func_names[-1] if func_names else '',
-        ]
+        row_values = [chain.chain_id, from_pascal_case(chain.chain_type)]
+
         for i in range(max_functions):
             row_values += [
                 func_ids[i]   if i < len(func_ids)   else '',
                 func_names[i] if i < len(func_names) else '',
                 '',  # Involvement ID — not stored in SysML
             ]
+
         for i in range(max_exchanges):
-            row_values += [
-                exch_ids[i]   if i < len(exch_ids)   else '',
-                exch_names[i] if i < len(exch_names) else '',
-                '',  # Involvement ID — not stored in SysML
-            ]
+            if i < len(chain.exchanges):
+                ex = chain.exchanges[i]
+                row_values += [
+                    ex['exchange_id'],
+                    ex['exchange_name'],
+                    ex['involvement_id'],
+                    ex['source_function_id'],
+                    ex['source_function_name'],
+                    ex['target_function_id'],
+                    ex['target_function_name'],
+                ]
+            else:
+                row_values += ['', '', '', '', '', '', '']
 
         r = ws.max_row + 1
         for col, value in enumerate(row_values, 1):
