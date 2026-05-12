@@ -221,17 +221,17 @@ def get_action_id_to_name_map(content: str) -> Dict[str, str]:
 
 
 def get_all_part_defs(content: str) -> Dict[str, str]:
-    """Return {type_name: full_definition} for all part defs in SysML text."""
+    """Return {type_name: full_definition} for all part/item defs in SysML text."""
     return {
         m.group(1): m.group(0)
-        for m in re.finditer(r"part def (\w+)\s*\{([^}]*)\}", content, re.DOTALL)
+        for m in re.finditer(r"(?:part|item) def (\w+)\s*\{([^}]*)\}", content, re.DOTALL)
     }
 
 
 def get_part_id_to_name_map(content: str) -> Dict[str, str]:
-    """Return {part_id: type_name} from SysML text by scanning part def bodies."""
+    """Return {part_id: type_name} from SysML text by scanning part/item def bodies."""
     id_to_name: Dict[str, str] = {}
-    for m in re.finditer(r"part def (\w+)\s*\{([^}]*)\}", content, re.DOTALL):
+    for m in re.finditer(r"(?:part|item) def (\w+)\s*\{([^}]*)\}", content, re.DOTALL):
         id_match = re.search(r"/\*\s*ID:\s*([\w\-]+)\s*\*/", m.group(2))
         if id_match:
             id_to_name[id_match.group(1)] = m.group(1)
@@ -300,6 +300,7 @@ def match_part_name(part_name: str, part_id: str, id_to_name_map: Dict[str, str]
 class PartNode:
     name: str
     id: str = ""
+    node_type: str = "Component"  # "Actor" or "Component"
     children: list = field(default_factory=list)  # list[PartNode]
 
 
@@ -308,22 +309,34 @@ def _parse_part_rows(rows: List[tuple]) -> List[PartNode]:
     if not rows:
         return []
 
-    level_cols = _detect_id_name_pairs(rows[0])
+    header = rows[0]
+    level_cols = _detect_id_name_pairs(header)
     if not level_cols:
         print("Warning: could not detect ID/Name column pairs from header.", file=sys.stderr)
-        print(f"  Header: {rows[0]}", file=sys.stderr)
+        print(f"  Header: {header}", file=sys.stderr)
         return []
+
+    # Detect the type column (e.g. "System Type", "SubSystem Type") for each level.
+    # Reuses the same helper used for function-kind columns.
+    type_cols = [_detect_kind_col(header, id_col) for id_col, _ in level_cols]
 
     roots: List[PartNode] = []
     current_at_level: Dict[int, PartNode] = {}
 
     for row in rows[1:]:
-        row = list(row) + [None] * (len(level_cols) * 3)
+        row = list(row) + [None] * (len(level_cols) * 4)
         for level, (col_id, col_name) in enumerate(level_cols):
             cell_id = row[col_id]
             cell_name = row[col_name]
             if cell_id and cell_name:
-                node = PartNode(name=str(cell_name).strip(), id=str(cell_id).strip())
+                type_col = type_cols[level]
+                raw_type = str(row[type_col]).strip() if type_col >= 0 and row[type_col] else "Component"
+                node_type = "Actor" if raw_type.lower() == "actor" else "Component"
+                node = PartNode(
+                    name=str(cell_name).strip(),
+                    id=str(cell_id).strip(),
+                    node_type=node_type,
+                )
                 current_at_level[level] = node
                 for deeper in [k for k in current_at_level if k > level]:
                     del current_at_level[deeper]
@@ -397,35 +410,205 @@ def _collect_all_part_ids(parts: List[PartNode]) -> Dict[str, List[str]]:
     return all_ids
 
 
+def _reindent_perform_blocks(blocks: List[str], content_indent: str) -> List[str]:
+    """Re-indent perform blocks from INDENT*2/INDENT*3 base to content_indent."""
+    result = []
+    for block in blocks:
+        block_lines = block.split("\n")
+        reindented = []
+        for bl in block_lines:
+            if bl.startswith(INDENT * 3):
+                reindented.append(content_indent + INDENT + bl[len(INDENT * 3):])
+            elif bl.startswith(INDENT * 2):
+                reindented.append(content_indent + bl[len(INDENT * 2):])
+            else:
+                reindented.append(bl)
+        result.append("\n".join(reindented))
+    return result
+
+
+def _inject_ports_into_usage(
+    content: str, type_name: str, ports: List[Tuple[str, str, str]]
+) -> str:
+    """Inject port blocks into the usage block (part/item usage : TypeName) for the given type.
+    Expands a bare semicolon usage to a block if needed.
+    """
+    # Try existing block usage: part/item usage : TypeName {
+    pattern_block = rf"\b(?:part|item)\s+\w+\s*:\s*{re.escape(type_name)}\s*\{{"
+    m = re.search(pattern_block, content)
+    if m:
+        line_start = content.rfind("\n", 0, m.start()) + 1
+        opening_line = content[line_start:m.end()]
+        block_indent = " " * (len(opening_line) - len(opening_line.lstrip()))
+        content_indent = block_indent + INDENT
+        port_lines = []
+        for usage, port_def, p_id in ports:
+            port_lines += [
+                f"{content_indent}port {usage} : {port_def} {{",
+                f"{content_indent}{INDENT}doc",
+                f"{content_indent}{INDENT}/* ID: {p_id} */",
+                f"{content_indent}}}",
+            ]
+        insert_pos = m.end()
+        return content[:insert_pos] + "\n" + "\n".join(port_lines) + content[insert_pos:]
+
+    # Try bare usage: part/item usage : TypeName;
+    pattern_bare = rf"\b((?:part|item))\s+(\w+)\s*:\s*{re.escape(type_name)}\s*;"
+    m_bare = re.search(pattern_bare, content)
+    if m_bare:
+        line_start = content.rfind("\n", 0, m_bare.start()) + 1
+        opening_line = content[line_start:m_bare.end()]
+        block_indent = " " * (len(opening_line) - len(opening_line.lstrip()))
+        content_indent = block_indent + INDENT
+        port_lines = []
+        for usage, port_def, p_id in ports:
+            port_lines += [
+                f"{content_indent}port {usage} : {port_def} {{",
+                f"{content_indent}{INDENT}doc",
+                f"{content_indent}{INDENT}/* ID: {p_id} */",
+                f"{content_indent}}}",
+            ]
+        kw = m_bare.group(1)
+        uname = m_bare.group(2)
+        replacement = (
+            f"{kw} {uname} : {type_name} {{\n"
+            + "\n".join(port_lines)
+            + f"\n{block_indent}}}"
+        )
+        return content[:m_bare.start()] + replacement + content[m_bare.end():]
+
+    return content
+
+
+def _insert_in_section(content: str, section_marker: str, new_lines: List[str]) -> str:
+    """Insert new_lines at the end of the named section (before the next section header)."""
+    lines = content.split("\n")
+    section_idx = -1
+    next_section_idx = len(lines)
+
+    for i, line in enumerate(lines):
+        if section_marker in line:
+            section_idx = i
+        elif section_idx != -1 and "// =====" in line:
+            next_section_idx = i
+            break
+
+    if section_idx == -1:
+        # Section not found: append before closing }
+        for i in range(len(lines) - 1, -1, -1):
+            if lines[i].strip() == "}":
+                lines = lines[:i] + [""] + new_lines + [""] + lines[i:]
+                return "\n".join(lines)
+        return content
+
+    # Insert before next section, trimming trailing blank lines in the gap
+    insert_idx = next_section_idx
+    while insert_idx > section_idx + 1 and lines[insert_idx - 1].strip() == "":
+        insert_idx -= 1
+
+    lines = lines[:insert_idx] + new_lines + [""] + lines[insert_idx:]
+    return "\n".join(lines)
+
+
 def generate_parts_sysml(parts: List[PartNode], package_name: str = "Parts") -> str:
-    """Produce a complete SysML v2 package string for part definitions."""
+    """Produce a SysML v2 package in trysmtout.sysml style:
+    bare defs in section-commented blocks + nested usage section.
+    Part/item defs are bare (no ports or actions); usages carry ports, actions, and connections.
+    """
     canonical = _collect_canonical_parts(parts)
     all_ids = _collect_all_part_ids(parts)
-    emitted: Set[str] = set()
+
+    # Collect all nodes with depth info, preserving encounter order
+    ordered_components: List[Tuple[str, PartNode, int]] = []
+    ordered_actors: List[Tuple[str, PartNode]] = []
+    emitted_collect: Set[str] = set()
+
+    def collect(node: PartNode, depth: int = 0) -> None:
+        tname = to_type_name(node.name, node.id)
+        if tname in emitted_collect:
+            return
+        emitted_collect.add(tname)
+        cn = canonical[tname]
+        if cn.node_type.lower() == "actor":
+            ordered_actors.append((tname, cn))
+        else:
+            ordered_components.append((tname, cn, depth))
+        for child in cn.children:
+            collect(child, depth + 1)
+
+    for root in parts:
+        collect(root, 0)
 
     lines: List[str] = [f"package {package_name} {{", ""]
 
-    def emit(node: PartNode) -> None:
-        tname = to_type_name(node.name, node.id)
-        if tname in emitted:
-            return
-        emitted.add(tname)
-        cn = canonical[tname]
+    # ===== Part Definitions (bare) =====
+    lines.append(f"{INDENT}// ===== Part Definitions (bare - ports and actions live on usages) =====")
+    lines.append("")
+    for tname, cn, depth in ordered_components:
         lines.append(f"{INDENT}part def {tname} {{")
         for id_val in all_ids.get(tname, []):
             lines.append(f"{INDENT * 2}doc")
             lines.append(f"{INDENT * 2}/* ID: {id_val} */")
-        for child in cn.children:
-            child_type = to_type_name(child.name, child.id)
-            child_usage = to_usage_name(child.name, child.id)
-            lines.append(f"{INDENT * 2}part {child_usage} : {child_type};")
         lines.append(f"{INDENT}}}")
         lines.append("")
-        for child in cn.children:
-            emit(child)
 
-    for root in parts:
-        emit(root)
+    # ===== Item Definitions (bare) =====
+    if ordered_actors:
+        lines.append(f"{INDENT}// ===== Item Definitions (bare - ports and actions live on usages) =====")
+        lines.append("")
+        for tname, cn in ordered_actors:
+            lines.append(f"{INDENT}item def {tname} {{")
+            for id_val in all_ids.get(tname, []):
+                lines.append(f"{INDENT * 2}doc")
+                lines.append(f"{INDENT * 2}/* ID: {id_val} */")
+            lines.append(f"{INDENT}}}")
+            lines.append("")
+
+    # ===== Port Definitions placeholder (populated by inject_component_exchanges) =====
+    lines.append(f"{INDENT}// ===== Port Definitions =====")
+    lines.append("")
+
+    # ===== Interface Definitions placeholder =====
+    lines.append(f"{INDENT}// ===== Interface Definitions =====")
+    lines.append("")
+
+    # ===== Connection Definitions placeholder =====
+    lines.append(f"{INDENT}// ===== Connection Definitions (typed ends only - actual connections are interface usages) =====")
+    lines.append("")
+
+    # ===== Item Usages (actors as flat usages; ports/actions added by later steps) =====
+    if ordered_actors:
+        lines.append(f"{INDENT}// ===== Item Usages (ports and actions defined here, not in the item defs) =====")
+        lines.append("")
+        for tname, cn in ordered_actors:
+            usage_name = to_usage_name(cn.name, cn.id)
+            lines.append(f"{INDENT}item {usage_name} : {tname};")
+            lines.append("")
+
+    # ===== Part Usages (depth-0 components as package-level usage blocks, children nested) =====
+    depth0_components = [(tname, cn) for tname, cn, depth in ordered_components if depth == 0]
+    if depth0_components:
+        lines.append(f"{INDENT}// ===== Part Usage (ports, nested parts with ports/actions, and connections defined here) =====")
+        lines.append("")
+        emitted_usages: Set[str] = set()
+
+        def emit_usage(node: PartNode, ind_level: int) -> None:
+            utname = to_type_name(node.name, node.id)
+            if utname in emitted_usages:
+                return
+            emitted_usages.add(utname)
+            ucn = canonical[utname]
+            usage_name = to_usage_name(ucn.name, ucn.id)
+            ind = INDENT * ind_level
+            part_children = [c for c in ucn.children if c.node_type.lower() != "actor"]
+            lines.append(f"{ind}part {usage_name} : {utname} {{")
+            for child in part_children:
+                emit_usage(child, ind_level + 1)
+            lines.append(f"{ind}}}")
+            lines.append("")
+
+        for tname, cn in depth0_components:
+            emit_usage(cn, 1)
 
     lines.append("}")
     return "\n".join(lines)
@@ -749,9 +932,12 @@ def _build_perform_block(action_name: str, action_type: str, function_id: str) -
 def _insert_into_part_def(
     content: str, type_name: str, perform_blocks: List[str], part_defs: Dict[str, str]
 ) -> str:
-    """Insert perform_blocks before the closing '}' of the named part def."""
+    """Insert perform_blocks before the closing '}' of the named part/item usage.
+    Searches usage blocks first (part/item usage : TypeName {), then bare usages
+    (expanding them to blocks), then falls back to def blocks.
+    Re-indents blocks to match the actual nesting depth found.
+    """
     matched_name = None
-    # Try exact match, then prefix match
     if type_name in part_defs:
         matched_name = type_name
     else:
@@ -762,23 +948,58 @@ def _insert_into_part_def(
                 break
 
     if not matched_name:
-        print(f"Warning: 'part def {type_name}' not found; allocation skipped.", file=sys.stderr)
+        print(f"Warning: '{type_name}' not found in part/item defs; allocation skipped.", file=sys.stderr)
         return content
 
-    pattern = rf"part def {re.escape(matched_name)}\s*\{{"
-    m = re.search(pattern, content)
-    if not m:
-        print(f"Warning: 'part def {matched_name}' not found; allocation skipped.", file=sys.stderr)
-        return content
+    # 1. Try block usage: part/item usage : TypeName {
+    pattern_block = rf"\b(?:part|item)\s+\w+\s*:\s*{re.escape(matched_name)}\s*\{{"
+    m = re.search(pattern_block, content)
+    if m:
+        line_start_open = content.rfind("\n", 0, m.start()) + 1
+        opening_line = content[line_start_open:m.end()]
+        block_indent = " " * (len(opening_line) - len(opening_line.lstrip()))
+        content_indent = block_indent + INDENT
+        brace_pos = m.end() - 1
+        end_pos = _find_block_end(content, brace_pos)
+        if end_pos == -1:
+            print(f"Warning: unmatched '{{' for '{matched_name}'.", file=sys.stderr)
+            return content
+        reindented = _reindent_perform_blocks(perform_blocks, content_indent)
+        line_start = content.rfind("\n", 0, end_pos) + 1
+        return content[:line_start] + "\n".join(reindented) + "\n" + content[line_start:]
 
-    brace_pos = m.end() - 1
-    end_pos = _find_block_end(content, brace_pos)
-    if end_pos == -1:
-        print(f"Warning: unmatched '{{' for 'part def {matched_name}'.", file=sys.stderr)
-        return content
+    # 2. Try bare usage: part/item usage : TypeName;  (expand to block)
+    pattern_bare = rf"\b((?:part|item))\s+(\w+)\s*:\s*{re.escape(matched_name)}\s*;"
+    m_bare = re.search(pattern_bare, content)
+    if m_bare:
+        line_start_open = content.rfind("\n", 0, m_bare.start()) + 1
+        opening_line = content[line_start_open:m_bare.end()]
+        block_indent = " " * (len(opening_line) - len(opening_line.lstrip()))
+        content_indent = block_indent + INDENT
+        kw = m_bare.group(1)
+        uname = m_bare.group(2)
+        reindented = _reindent_perform_blocks(perform_blocks, content_indent)
+        replacement = (
+            f"{kw} {uname} : {matched_name} {{\n"
+            + "\n".join(reindented)
+            + f"\n{block_indent}}}"
+        )
+        return content[:m_bare.start()] + replacement + content[m_bare.end():]
 
-    line_start = content.rfind("\n", 0, end_pos) + 1
-    return content[:line_start] + "\n".join(perform_blocks) + "\n" + content[line_start:]
+    # 3. Fallback: def block
+    pattern_def = rf"(?:part|item) def {re.escape(matched_name)}\s*\{{"
+    m_def = re.search(pattern_def, content)
+    if m_def:
+        brace_pos = m_def.end() - 1
+        end_pos = _find_block_end(content, brace_pos)
+        if end_pos == -1:
+            print(f"Warning: unmatched '{{' for '{matched_name}'.", file=sys.stderr)
+            return content
+        line_start = content.rfind("\n", 0, end_pos) + 1
+        return content[:line_start] + "\n".join(perform_blocks) + "\n" + content[line_start:]
+
+    print(f"Warning: '{matched_name}' not found as usage or def; allocation skipped.", file=sys.stderr)
+    return content
 
 
 def merge_allocations_into_parts(
@@ -1136,6 +1357,31 @@ def inject_functional_exchanges(sysml_text: str, exchanges: List[FunctionalExcha
                 f"{INDENT}}}", "",
             ]
 
+    existing_viz_actions: Set[str] = set(
+        re.findall(r"^    action\s+(\w+)\s*:\s*\w+\s*;", sysml_text, re.MULTILINE)
+    )
+    emitted_viz_actions: Set[str] = set(existing_viz_actions)
+
+    for exch in exchanges:
+        from_type = match_action_name(exch.from_action_name, exch.from_action_id, id_to_def_name)
+        to_type = match_action_name(exch.to_action_name, exch.to_action_id, id_to_def_name)
+        item_type = _item_type_name(exch, registry)
+        item_usage = _item_usage_name(exch, registry)
+        funcout_usage = to_port_usage_name(exch.from_port_name, exch.from_port_id)
+        funcin_usage = to_port_usage_name(exch.to_port_name, exch.to_port_id)
+        src_usage = to_usage_name(from_type)
+        tgt_usage = to_usage_name(to_type)
+        if src_usage not in emitted_viz_actions:
+            emitted_viz_actions.add(src_usage)
+            append_lines.append(f"{INDENT}action {src_usage} : {from_type};")
+        if tgt_usage not in emitted_viz_actions:
+            emitted_viz_actions.add(tgt_usage)
+            append_lines.append(f"{INDENT}action {tgt_usage} : {to_type};")
+        flow_from = f"flow of {item_type} from {src_usage}.{funcout_usage}.{item_usage}"
+        if flow_from not in sysml_text:
+            append_lines.append(f"{INDENT}{flow_from} to {tgt_usage}.{funcin_usage}.{item_usage};")
+        append_lines.append("")
+
     for exch, (conn_name, iface_name) in zip(exchanges, conn_iface_names):
         if conn_name not in existing_conn_defs:
             existing_conn_defs.add(conn_name)
@@ -1279,37 +1525,93 @@ def _build_ce_part_ports(
     return part_ports
 
 
+def _get_type_to_usage_map(sysml_text: str) -> Dict[str, str]:
+    """Return {type_name: usage_name} by scanning part/item usages in the SysML text."""
+    result: Dict[str, str] = {}
+    for m in re.finditer(r"\b(?:part|item)\s+(\w+)\s*:\s*(\w+)\s*[{;]", sysml_text):
+        usage_name = m.group(1)
+        type_name = m.group(2)
+        result.setdefault(type_name, usage_name)
+    return result
+
+
 def inject_component_exchanges(sysml_text: str, exchanges: List[ComponentExchange]) -> str:
-    """Return SysML text augmented with port usages, port defs, interface defs, and connection defs."""
+    """Return SysML text augmented with port usages (in usage blocks), port defs, interface defs,
+    bare connection defs, and interface usage statements.
+
+    Follows trysmtout.sysml style:
+    - Ports injected into part/item usage blocks (not defs)
+    - Port defs inserted in Port Definitions section (bare)
+    - Interface defs inserted in Interface Definitions section
+    - Connection defs inserted in Connection Definitions section (bare, no embedded connects)
+    - Internal connections placed inside container usage block as interface usages
+    - External connections placed at package level as interface usages
+    """
     part_id_to_name = get_part_id_to_name_map(sysml_text)
+    item_def_names: Set[str] = set(re.findall(r"\bitem def\s+(\w+)", sysml_text))
     part_ports = _build_ce_part_ports(exchanges, part_id_to_name)
 
+    # --- Build containment map: container_type -> {direct child type, ...} ---
+    container_parts: Dict[str, Set[str]] = {}
+    # Use [ \t]+ (not \s+) so blank lines don't match across line boundaries
+    for m in re.finditer(r"^[ \t]+part\s+\w+\s*:\s*(\w+)\s*\{", sysml_text, re.MULTILINE):
+        container_type = m.group(1)
+        brace_pos = m.end() - 1
+        end_pos = _find_block_end(sysml_text, brace_pos)
+        if end_pos == -1:
+            continue
+        block = sysml_text[m.end():end_pos]
+        # Derive indentation from match text (m.start() == line_start in MULTILINE mode)
+        match_str = m.group(0)
+        container_indent = len(match_str) - len(match_str.lstrip(" \t"))
+        child_prefix = " " * (container_indent + len(INDENT))
+        child_pat = re.compile(
+            rf"^{re.escape(child_prefix)}part\s+\w+\s*:\s*(\w+)\s*[{{;]", re.MULTILINE
+        )
+        children: Set[str] = set()
+        for child_m in child_pat.finditer(block):
+            children.add(child_m.group(1))
+        if children:
+            container_parts[container_type] = children
+
+    def get_container(from_type: str, to_type: str) -> Optional[str]:
+        """Return container type if both parts are contained within it, else None."""
+        for ct, children in container_parts.items():
+            internal = {ct} | children
+            if from_type in internal and to_type in internal:
+                return ct
+        return None
+
+    # --- Inject ports into part/item usages ---
     existing_port_usages: Set[str] = set(re.findall(r"\bport\s+(\w+)\s*:", sysml_text))
+    for part_type_name, ports in part_ports.items():
+        ports_to_add = [(u, pd, pid) for u, pd, pid in ports if u not in existing_port_usages]
+        if not ports_to_add:
+            continue
+        sysml_text = _inject_ports_into_usage(sysml_text, part_type_name, ports_to_add)
+        for u, _, _ in ports_to_add:
+            existing_port_usages.add(u)
+
+    # Build type->usage map now that all ports have been injected
+    type_to_usage = _get_type_to_usage_map(sysml_text)
+
+    def _qual_usage(type_name: str) -> str:
+        """Return fully-qualified usage path, e.g. 'logical_system.satellite' for nested types."""
+        for ct, children in container_parts.items():
+            if type_name in children:
+                parent = _qual_usage(ct)
+                leaf = type_to_usage.get(type_name, to_usage_name(type_name))
+                return f"{parent}.{leaf}"
+        return type_to_usage.get(type_name, to_usage_name(type_name))
+
+    # --- Build port defs, interface defs, connection defs ---
     existing_port_defs: Set[str] = set(re.findall(r"\bport def\s+(\w+)", sysml_text))
     existing_iface_defs: Set[str] = set(re.findall(r"\binterface def\s+(\w+)", sysml_text))
     existing_conn_defs: Set[str] = set(re.findall(r"\bconnection def\s+(\w+)", sysml_text))
 
-    lines = sysml_text.split("\n")
-    result: List[str] = []
-
-    for line in lines:
-        result.append(line)
-        id_match = re.search(r"/\* ID: ([\w\-]+) \*/", line)
-        if id_match:
-            part_id = id_match.group(1)
-            matched_part_name = part_id_to_name.get(part_id)
-            if matched_part_name and matched_part_name in part_ports:
-                base_indent = " " * (len(line) - len(line.lstrip()))
-                for usage, port_def, p_id in part_ports[matched_part_name]:
-                    if usage in existing_port_usages:
-                        continue
-                    existing_port_usages.add(usage)
-                    result.append(f"{base_indent}port {usage} : {port_def} {{")
-                    result.append(f"{base_indent}{INDENT}doc")
-                    result.append(f"{base_indent}{INDENT}/* ID: {p_id} */")
-                    result.append(f"{base_indent}}}")
-
-    append_lines: List[str] = []
+    port_def_lines: List[str] = []
+    iface_def_lines: List[str] = []
+    conn_def_lines: List[str] = []
 
     for exch in exchanges:
         exch_name = to_exchange_name(exch.exchange_name)
@@ -1318,13 +1620,13 @@ def inject_component_exchanges(sysml_text: str, exchanges: List[ComponentExchang
         for pd in [f"{exch_name}ConnectionPoint_{from_suffix}", f"{exch_name}ConnectionPoint_{to_suffix}"]:
             if pd not in existing_port_defs:
                 existing_port_defs.add(pd)
-                append_lines += [f"{INDENT}port def {pd};", ""]
+                port_def_lines += [f"{INDENT}port def {pd};", ""]
 
     for exch in exchanges:
-        iface_name = f"{to_exchange_name(exch.exchange_name)}_Interface"
+        exch_name = to_exchange_name(exch.exchange_name)
+        iface_name = f"{exch_name}_Interface"
         if iface_name not in existing_iface_defs:
             existing_iface_defs.add(iface_name)
-            exch_name = to_exchange_name(exch.exchange_name)
             from_suffix = to_component_suffix(exch.from_part_name)
             to_suffix = to_component_suffix(exch.to_part_name)
             from_port_def = f"{exch_name}ConnectionPoint_{from_suffix}"
@@ -1333,7 +1635,7 @@ def inject_component_exchanges(sysml_text: str, exchanges: List[ComponentExchang
             to_part_name = match_part_name(exch.to_part_name, exch.to_part_id, part_id_to_name)
             from_port_end = f"{to_usage_name(from_part_name)}Port"
             to_port_end = f"{to_usage_name(to_part_name)}Port"
-            append_lines += [
+            iface_def_lines += [
                 f"{INDENT}interface def {iface_name} {{",
                 f"{INDENT * 2}end port {from_port_end} : {from_port_def};",
                 f"{INDENT * 2}end port {to_port_end} : {to_port_def};",
@@ -1346,33 +1648,110 @@ def inject_component_exchanges(sysml_text: str, exchanges: List[ComponentExchang
             existing_conn_defs.add(exch_name)
             from_part_name = match_part_name(exch.from_part_name, exch.from_part_id, part_id_to_name)
             to_part_name = match_part_name(exch.to_part_name, exch.to_part_id, part_id_to_name)
-            from_port = to_port_usage_name(exch.from_port_name, exch.from_port_id)
-            to_port = to_port_usage_name(exch.to_port_name, exch.to_port_id)
             from_end = to_usage_name(from_part_name)
             to_end = to_usage_name(to_part_name)
-            append_lines += [
+            from_end_kw = "item" if from_part_name in item_def_names else "part"
+            to_end_kw = "item" if to_part_name in item_def_names else "part"
+            # Bare connection def (no embedded interface — connections are interface usages)
+            conn_def_lines += [
                 f"{INDENT}connection def {exch_name} {{",
                 f"{INDENT * 2}doc",
                 f"{INDENT * 2}/* ID: {exch.exchange_id} */",
-                f"{INDENT * 2}end part {from_end} : {from_part_name};",
-                f"{INDENT * 2}end part {to_end} : {to_part_name};",
-                f"{INDENT * 2}interface : {exch_name} connect {from_end}.{from_port} to {to_end}.{to_port};",
+                f"{INDENT * 2}end {from_end_kw} {from_end} : {from_part_name};",
+                f"{INDENT * 2}end {to_end_kw} {to_end} : {to_part_name};",
                 f"{INDENT}}}", "",
             ]
 
-    closing_idx: Optional[int] = None
-    for i in range(len(result) - 1, -1, -1):
-        if result[i].strip() == "}":
-            closing_idx = i
-            break
+    # --- Insert defs into section placeholders ---
+    if port_def_lines:
+        sysml_text = _insert_in_section(sysml_text, "// ===== Port Definitions =====", port_def_lines)
+    if iface_def_lines:
+        sysml_text = _insert_in_section(sysml_text, "// ===== Interface Definitions =====", iface_def_lines)
+    if conn_def_lines:
+        sysml_text = _insert_in_section(
+            sysml_text, "// ===== Connection Definitions (typed ends only", conn_def_lines
+        )
 
-    if closing_idx is None:
-        result.extend(append_lines)
-        result.append("}")
-    else:
-        result = result[:closing_idx] + append_lines + result[closing_idx:]
+    # --- Build interface usage statements (replace flow statements) ---
+    internal_conns: Dict[str, List[str]] = {}  # container_type -> [stmt, ...]
+    external_conns: List[str] = []
+    emitted_iface_usages: Set[str] = set()
 
-    return "\n".join(result)
+    for exch in exchanges:
+        exch_name = to_exchange_name(exch.exchange_name)
+        iface_name = f"{exch_name}_Interface"
+        from_part_name = match_part_name(exch.from_part_name, exch.from_part_id, part_id_to_name)
+        to_part_name = match_part_name(exch.to_part_name, exch.to_part_id, part_id_to_name)
+        from_port = to_port_usage_name(exch.from_port_name, exch.from_port_id)
+        to_port = to_port_usage_name(exch.to_port_name, exch.to_port_id)
+
+        iface_key = f"{iface_name}:{from_port}:{to_port}"
+        if iface_key in emitted_iface_usages:
+            continue
+        emitted_iface_usages.add(iface_key)
+
+        container = get_container(from_part_name, to_part_name)
+        if container:
+            # Internal: endpoint refs relative to container
+            # If endpoint IS the container, use port name only; otherwise prefix with usage name
+            from_uname = type_to_usage.get(from_part_name, to_usage_name(from_part_name))
+            to_uname = type_to_usage.get(to_part_name, to_usage_name(to_part_name))
+            from_ref = from_port if from_part_name == container else f"{from_uname}.{from_port}"
+            to_ref = to_port if to_part_name == container else f"{to_uname}.{to_port}"
+            # Store bare (no leading indent) — indentation applied at insertion time
+            stmt = f"interface : {iface_name} connect {from_ref} to {to_ref};"
+            internal_conns.setdefault(container, []).append(stmt)
+        else:
+            # External: package-level interface usage with fully-qualified paths
+            from_qual = _qual_usage(from_part_name)
+            to_qual = _qual_usage(to_part_name)
+            stmt = f"{INDENT}interface : {iface_name} connect {from_qual}.{from_port} to {to_qual}.{to_port};"
+            external_conns.append(stmt)
+
+    # Insert internal connections inside container usage block
+    for container_type, stmts in internal_conns.items():
+        m_cont = re.search(
+            rf"\bpart\s+\w+\s*:\s*{re.escape(container_type)}\s*\{{", sysml_text
+        )
+        if not m_cont:
+            continue
+        brace_pos = m_cont.end() - 1
+        end_pos = _find_block_end(sysml_text, brace_pos)
+        if end_pos == -1:
+            continue
+        existing_block = sysml_text[brace_pos:end_pos + 1]
+        new_stmts = [s for s in stmts if s not in existing_block]
+        if new_stmts:
+            # Derive container's indentation: spaces between line start and the 'part' keyword
+            cont_line_start = sysml_text.rfind("\n", 0, m_cont.start()) + 1
+            cont_indent_len = m_cont.start() - cont_line_start
+            inner = " " * (cont_indent_len + len(INDENT))
+            line_start = sysml_text.rfind("\n", 0, end_pos) + 1
+            comment = f"{inner}// Internal connections as interface usages"
+            insert_text = comment + "\n" + "\n".join(inner + s for s in new_stmts) + "\n"
+            sysml_text = sysml_text[:line_start] + insert_text + sysml_text[line_start:]
+
+    # Insert external connections before the closing }
+    if external_conns:
+        existing_ext = sysml_text
+        new_external = [s for s in external_conns if s.strip() not in existing_ext]
+        if new_external:
+            result_lines = sysml_text.split("\n")
+            closing_idx: Optional[int] = None
+            for i in range(len(result_lines) - 1, -1, -1):
+                if result_lines[i].strip() == "}":
+                    closing_idx = i
+                    break
+            if closing_idx is not None:
+                ext_block = (
+                    [f"{INDENT}// External interface connections (typed ends only)"]
+                    + new_external
+                    + [""]
+                )
+                result_lines = result_lines[:closing_idx] + [""] + ext_block + result_lines[closing_idx:]
+                sysml_text = "\n".join(result_lines)
+
+    return sysml_text
 
 
 def import_component_exchanges(rows: List[tuple], parts_path) -> None:
@@ -1404,6 +1783,8 @@ class ExchangeAllocation:
     component_exchange_name: str
     functional_exchange_name: str
     allocation_id: str
+    source_function_id: str = ""
+    target_function_id: str = ""
 
 
 def _parse_exchange_allocation_rows(rows: List[tuple]) -> List[ExchangeAllocation]:
@@ -1420,6 +1801,9 @@ def _parse_exchange_allocation_rows(rows: List[tuple]) -> List[ExchangeAllocatio
         print(f"Error: required column not found in header: {exc}", file=sys.stderr)
         return []
 
+    src_fn_col = header.index("Source Function ID") if "Source Function ID" in header else -1
+    tgt_fn_col = header.index("Target Function ID") if "Target Function ID" in header else -1
+
     seen: set = set()
     allocations: List[ExchangeAllocation] = []
     for row in rows[1:]:
@@ -1429,10 +1813,12 @@ def _parse_exchange_allocation_rows(rows: List[tuple]) -> List[ExchangeAllocatio
         aid = str(row[id_col]).strip() if row[id_col] else ""
         if not (ce and fe and aid):
             continue
+        src_fn = str(row[src_fn_col]).strip() if src_fn_col >= 0 and row[src_fn_col] else ""
+        tgt_fn = str(row[tgt_fn_col]).strip() if tgt_fn_col >= 0 and row[tgt_fn_col] else ""
         key = (ce, fe, aid)
         if key not in seen:
             seen.add(key)
-            allocations.append(ExchangeAllocation(ce, fe, aid))
+            allocations.append(ExchangeAllocation(ce, fe, aid, src_fn, tgt_fn))
 
     return allocations
 
@@ -1445,8 +1831,26 @@ def load_exchange_allocations(path: pathlib.Path, sheet_name: Optional[str] = No
 
 
 def _strip_flow_lines(content: str) -> str:
+    """Remove 'flow of ...' statements inside block defs (indented 5+ spaces).
+    Top-level package-member flow statements (4-space indent) are preserved,
+    as those are component-exchange flows generated separately.
+    """
     lines = content.split("\n")
-    return "\n".join(line for line in lines if not re.match(r"^\s+flow\s+of\b", line))
+    result: List[str] = []
+    skip_depth = 0
+    for line in lines:
+        if skip_depth > 0:
+            skip_depth += line.count("{") - line.count("}")
+            if skip_depth <= 0:
+                skip_depth = 0
+            continue
+        if re.match(r"^ {5,}flow\s+of\b", line):
+            opens = line.count("{") - line.count("}")
+            if opens > 0:
+                skip_depth = opens
+            continue
+        result.append(line)
+    return "\n".join(result)
 
 
 def _strip_allocation_port_items(content: str) -> str:
@@ -1520,10 +1924,73 @@ def _insert_into_interface_def(content: str, iface_name: str, flow_lines: List[s
     return content[:line_start] + "\n".join(flow_lines) + "\n" + content[line_start:]
 
 
+def _build_function_to_part_map(parts_content: str) -> Dict[str, str]:
+    """Return {function_id: part_type_name} by scanning perform action doc blocks in parts SysML.
+    Scans part/item usage blocks (part/item usage : TypeName {) since perform actions
+    live in usages in the new structure, not in defs.
+    """
+    result: Dict[str, str] = {}
+    # Match usage blocks: part/item usageName : TypeName {  (not def blocks)
+    for part_m in re.finditer(r'\b(?:part|item)\s+\w+\s*:\s*(\w+)\s*\{', parts_content):
+        part_name = part_m.group(1)  # type name (e.g. Antenna_8200)
+        brace_pos = part_m.end() - 1
+        part_end = _find_block_end(parts_content, brace_pos)
+        if part_end == -1:
+            continue
+        part_body = parts_content[brace_pos:part_end + 1]
+        for perf_m in re.finditer(r'\bperform\s+action\b[^{;]*\{', part_body):
+            perf_brace = perf_m.end() - 1
+            perf_end = _find_block_end(part_body, perf_brace)
+            if perf_end == -1:
+                continue
+            perf_block = part_body[perf_brace:perf_end + 1]
+            id_m = re.search(r'/\* ID: ([\w\-]+) \*/', perf_block)
+            if id_m:
+                result[id_m.group(1)] = part_name
+    return result
+
+
+def _resolve_item_direction(
+    alloc: ExchangeAllocation,
+    func_to_part: Dict[str, str],
+    from_port_name: str,
+    from_port_type: str,
+    to_port_name: str,
+) -> Tuple[str, str, str, str]:
+    """Return (from_item_dir, to_item_dir, flow_source_port, flow_target_port).
+
+    Determines the in/out direction for an item in each port def and the
+    corresponding flow of statement direction.  Uses the allocation's
+    source_function_id to find which part originates the functional exchange:
+    if the source function is in the from_port's part, the exchange flows
+    from_port → to_port; otherwise it flows to_port → from_port.
+    """
+    # Extract the part-name suffix encoded in the from_port_type:
+    # e.g. "HST_HSS_ClassConnectionPoint_HighSchoolTeacher" → "HighSchoolTeacher"
+    from_port_suffix = ""
+    if "ConnectionPoint_" in from_port_type:
+        from_port_suffix = from_port_type.split("ConnectionPoint_")[-1]
+
+    if alloc.source_function_id and from_port_suffix:
+        source_part = func_to_part.get(alloc.source_function_id, "")
+        if source_part:
+            if from_port_suffix in source_part:
+                # Source function is in the from_port's part → flow from_port → to_port
+                return ("out", "in", from_port_name, to_port_name)
+            else:
+                # Source function is in the to_port's part → flow to_port → from_port
+                return ("in", "out", to_port_name, from_port_name)
+
+    # Fallback: from_port is out, to_port is in
+    return ("out", "in", from_port_name, to_port_name)
+
+
 def inject_exchange_allocations(parts_content: str, allocations: List[ExchangeAllocation]) -> str:
     """Inject 'flow of' lines (and required port-def items) for each allocation."""
     content = _strip_flow_lines(parts_content)
     content = _strip_allocation_port_items(content)
+
+    func_to_part = _build_function_to_part_map(content)
 
     by_ce: Dict[str, List[ExchangeAllocation]] = {}
     for alloc in allocations:
@@ -1545,14 +2012,21 @@ def inject_exchange_allocations(parts_content: str, allocations: List[ExchangeAl
             fe_type = to_type_name(alloc.functional_exchange_name)
             fe_usage = to_usage_name(alloc.functional_exchange_name)
 
-            if not from_conj:
-                content = _ensure_port_def_has_item(content, from_port_type, fe_type, fe_usage, "out")
-            if not to_conj:
-                content = _ensure_port_def_has_item(content, to_port_type, fe_type, fe_usage, "in")
-
-            flow_lines.append(
-                f"{INDENT * 2}flow of {fe_type} from {from_port_name}.{fe_usage} to {to_port_name}.{fe_usage};"
+            from_dir, to_dir, flow_from, flow_to = _resolve_item_direction(
+                alloc, func_to_part, from_port_name, from_port_type, to_port_name,
             )
+
+            if not from_conj:
+                content = _ensure_port_def_has_item(content, from_port_type, fe_type, fe_usage, from_dir)
+            if not to_conj:
+                content = _ensure_port_def_has_item(content, to_port_type, fe_type, fe_usage, to_dir)
+
+            flow_lines += [
+                f"{INDENT * 2}flow of {fe_type} from {flow_from}.{fe_usage} to {flow_to}.{fe_usage} {{",
+                f"{INDENT * 3}doc",
+                f"{INDENT * 3}/* ID: {alloc.allocation_id} */",
+                f"{INDENT * 2}}}",
+            ]
 
         content = _insert_into_interface_def(content, iface_name, flow_lines)
 
