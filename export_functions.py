@@ -253,9 +253,16 @@ def _get_direct_child_types(body: str) -> List[Tuple[str, int]]:
 
 
 def _build_usage_to_type_map(content: str) -> Dict[str, str]:
-    """Return {usage_name: type_name} from all part/item usage declarations in *content*."""
+    """Return {usage_name: type_name} from all part/item usage declarations in *content*.
+
+    Handles both simple usages ('part name : Type') and usages with multiplicities
+    ('part name [N] : Type' or 'part [N] name : Type').
+    """
     result: Dict[str, str] = {}
-    for m in re.finditer(r'(?:part|item)\s+(\w+)\s*:\s*(\w+)\s*[{;]', content):
+    for m in re.finditer(
+        r'(?:part|item)\s+(?:\[\d+\]\s+)?(\w+)\s*(?:\[\d+\])?\s*:\s*(\w+)\s*[{;]',
+        content,
+    ):
         result.setdefault(m.group(1), m.group(2))
     return result
 
@@ -373,27 +380,34 @@ def _parse_parts_hierarchy(file_path: pathlib.Path) -> Tuple[List[Dict], Dict]:
                 'node_type': node_type,
             }
 
-    # New-style detection: if no def body contains child usages, the hierarchy
-    # is expressed through nested usage blocks instead.
-    if not any(d['usages'] for d in part_defs.values()):
-        for m in re.finditer(
-            r'(?:part|item)\s+(?:\[\d+\]\s+)?\w+\s*(?:\[\d+\])?\s*:\s*(\w+)\s*\{',
-            parts_content
-        ):
-            parent_type = m.group(1)
-            if parent_type not in part_defs:
-                continue
-            body, _ = get_block(parts_content, m.end())
-            raw_children = [(t, n) for t, n in _get_direct_child_types(body) if t in part_defs]
-            if raw_children and not part_defs[parent_type]['usages']:
-                expanded: List[Tuple[str, str]] = []
-                for child_type, count in raw_children:
+    # Always scan usage blocks for hierarchy, merging with any child usages
+    # already captured from def bodies (deduplication by child type name).
+    # This handles:
+    #   - New-style: bare defs where hierarchy lives in usage blocks.
+    #   - Old-style: everything in def bodies (usage scan finds nothing new).
+    #   - Mixed-style: some hierarchy in def bodies, rest in usage blocks.
+    # _get_direct_child_types skips nested { } blocks so only direct children
+    # of each usage block are added, preventing ancestors from absorbing
+    # their grandchildren.
+    for m in re.finditer(
+        r'(?:part|item)\s+(?:\[\d+\]\s+)?\w+\s*(?:\[\d+\])?\s*:\s*(\w+)\s*\{',
+        parts_content
+    ):
+        parent_type = m.group(1)
+        if parent_type not in part_defs:
+            continue
+        body, _ = get_block(parts_content, m.end())
+        raw_children = [(t, n) for t, n in _get_direct_child_types(body) if t in part_defs]
+        if raw_children:
+            existing_child_types = {t for t, _ in part_defs[parent_type]['usages']}
+            for child_type, count in raw_children:
+                if child_type not in existing_child_types:
                     if count == 1:
-                        expanded.append((child_type, ''))
+                        part_defs[parent_type]['usages'].append((child_type, ''))
                     else:
                         for _ in range(count):
-                            expanded.append((child_type, str(_uuid.uuid4())))
-                part_defs[parent_type]['usages'] = expanded
+                            part_defs[parent_type]['usages'].append((child_type, str(_uuid.uuid4())))
+                    existing_child_types.add(child_type)
 
     all_used = {t for d in part_defs.values() for t, _ in d['usages']}
     top_level = [n for n in part_defs if n not in all_used]
@@ -730,7 +744,8 @@ def export_allocations(ws, parts_path: pathlib.Path, functions_path: pathlib.Pat
             ws.cell(row=row, column=func_name_col, value=from_pascal_case(item['name']))
 
     _auto_adjust_columns(ws)
-    print(f"  -> {len(hierarchy)} allocation items exported.")
+    func_count = sum(1 for item in hierarchy if item['type'] == 'function')
+    print(f"  -> {func_count} functions exported in 'Link Systems and Functions'.")
 
 
 # ============================================================================
@@ -885,6 +900,13 @@ def _parse_component_exchanges(file_path: pathlib.Path) -> List[Dict]:
 
     Supports both old-style (ports and interface connects inside def bodies) and
     new-style (bare defs, ports in usage blocks, interface usages at package/container level).
+
+    Also handles:
+    - Conjugate port types (``~Type``) — the ``~`` prefix is stripped for direction lookup
+      and the direction is flipped (IN↔OUT; INOUT stays INOUT).
+    - Semicolon-terminated ports (``port x : T;``) in addition to body ports (``port x : T { }``).
+    - Named interface usages (``interface name : Type connect a.p to b.q;``) as component
+      exchanges, covering the case where one interface def is reused by multiple usages.
     """
     with open(file_path, 'r', encoding='utf-8') as f:
         raw = f.read()
@@ -895,60 +917,100 @@ def _parse_component_exchanges(file_path: pathlib.Path) -> List[Dict]:
         print(f"Error: {exc}", file=sys.stderr)
         return []
 
-    # Build port def name -> direction mapping (same for both styles)
+    # Build port def name -> direction mapping
     port_def_directions: Dict[str, str] = {}
     for m in re.finditer(r'port def (\w+)\s*\{', content):
         port_type_name = m.group(1)
         body, _ = get_block(content, m.end())
         port_def_directions[port_type_name] = _determine_port_direction(body)
 
-    # Collect part/item def IDs (needed in both styles for fallback)
+    def _port_direction(port_type_raw: str) -> str:
+        """Look up direction for a port type, handling the conjugate (~) prefix."""
+        conjugate = port_type_raw.startswith('~')
+        base_type = port_type_raw.lstrip('~')
+        direction = port_def_directions.get(base_type, '')
+        if conjugate:
+            direction = _OPPOSITE_DIRECTION.get(direction, direction)
+        return direction
+
+    # Collect part/item def IDs
     part_def_ids: Dict[str, str] = {}
     for m in re.finditer(r'(?:part|item) def (\w+)\s*\{', content):
         name = m.group(1)
         body, _ = get_block(content, m.end())
         part_def_ids[name] = extract_id(body)
+    for m in re.finditer(r'(?:part|item) def (\w+)\s*;', content):
+        name = m.group(1)
+        if name not in part_def_ids:
+            part_def_ids[name] = extract_id(name)
 
     # --- Build part_port_map: type_name -> {port_usage: {id, part_id, direction}} ---
-    # Old-style: ports live inside part/item def bodies
+    # Scan def bodies for both body ports (port x : T { }) and semicolon ports (port x : T;).
+    # Port types may include a conjugate prefix (~).
     part_port_map: Dict = {name: {} for name in part_def_ids}
     for m in re.finditer(r'(?:part|item) def (\w+)\s*\{', content):
         name = m.group(1)
         body, _ = get_block(content, m.end())
         part_id = part_def_ids[name]
-        for pm in re.finditer(r'port (\w+)\s*:\s*(\w+)\s*\{', body):
-            port_name = pm.group(1)
-            port_type = pm.group(2)
-            port_body, _ = get_block(body, pm.end())
+
+        # Ports declared with a body block (port x : ~T { ... })
+        for pm in re.finditer(r'port\s+(\w+)\s*:\s*(~?\w+)\s*\{', body):
+            port_name     = pm.group(1)
+            port_type_raw = pm.group(2)
+            port_body, _  = get_block(body, pm.end())
+            port_id = extract_id(port_body) if port_body.strip() else extract_id(f'{name}.{port_name}')
             part_port_map[name][port_name] = {
-                'id':        extract_id(port_body),
+                'id':        port_id,
                 'part_id':   part_id,
-                'direction': port_def_directions.get(port_type, ''),
+                'direction': _port_direction(port_type_raw),
             }
 
-    # New-style: if no ports found in defs, scan usage blocks instead
+        # Ports declared with a semicolon (port x : ~T;)
+        for pm in re.finditer(r'port\s+(\w+)\s*:\s*(~?\w+)\s*;', body):
+            port_name     = pm.group(1)
+            port_type_raw = pm.group(2)
+            if port_name not in part_port_map[name]:
+                part_port_map[name][port_name] = {
+                    'id':        extract_id(f'{name}.{port_name}'),
+                    'part_id':   part_id,
+                    'direction': _port_direction(port_type_raw),
+                }
+
+    # New-style fallback: if no ports found in def bodies, scan usage blocks instead
     if not any(ports for ports in part_port_map.values()):
         for m in re.finditer(r'(?:part|item)\s+\w+\s*:\s*(\w+)\s*\{', content):
             type_name = m.group(1)
             if type_name not in part_def_ids:
                 continue
-            body, _ = get_block(content, m.end())
-            part_id = part_def_ids[type_name]
-            for pm in re.finditer(r'port\s+(\w+)\s*:\s*(\w+)\s*\{', body):
-                port_name = pm.group(1)
-                port_type = pm.group(2)
-                port_body, _ = get_block(body, pm.end())
+            body, _  = get_block(content, m.end())
+            part_id  = part_def_ids[type_name]
+            for pm in re.finditer(r'port\s+(\w+)\s*:\s*(~?\w+)\s*\{', body):
+                port_name     = pm.group(1)
+                port_type_raw = pm.group(2)
+                port_body, _  = get_block(body, pm.end())
+                if port_name not in part_port_map[type_name]:
+                    port_id = extract_id(port_body) if port_body.strip() else extract_id(f'{type_name}.{port_name}')
+                    part_port_map[type_name][port_name] = {
+                        'id':        port_id,
+                        'part_id':   part_id,
+                        'direction': _port_direction(port_type_raw),
+                    }
+            for pm in re.finditer(r'port\s+(\w+)\s*:\s*(~?\w+)\s*;', body):
+                port_name     = pm.group(1)
+                port_type_raw = pm.group(2)
                 if port_name not in part_port_map[type_name]:
                     part_port_map[type_name][port_name] = {
-                        'id':        extract_id(port_body),
+                        'id':        extract_id(f'{type_name}.{port_name}'),
                         'part_id':   part_id,
-                        'direction': port_def_directions.get(port_type, ''),
+                        'direction': _port_direction(port_type_raw),
                     }
 
     # Build a global usage-name → type-name map for resolving interface connect paths
     usage_to_type = _build_usage_to_type_map(content)
 
     connections: List[Dict] = []
+
+    # ── 1. connection def blocks (old-style / structural connection definitions) ──
     for m in re.finditer(r'connection def (\w+)\s*\{', content):
         conn_name = m.group(1)
         body, _ = get_block(content, m.end())
@@ -961,15 +1023,14 @@ def _parse_component_exchanges(file_path: pathlib.Path) -> List[Dict]:
         from_part_type = end_parts[0][1]
         to_part_type   = end_parts[1][1]
 
-        # Old-style: interface connect is embedded inside the connection def body
+        # Old-style: anonymous interface connect embedded in the connection def body
         iface_m = re.search(
-            r'interface : \w+\s+connect\s+(\w+)\.(\w+)\s+to\s+(\w+)\.(\w+)', body
+            r'interface\s*:\s*\w+\s+connect\s+(\w+)\.(\w+)\s+to\s+(\w+)\.(\w+)', body
         )
         if iface_m:
             _, from_port_usage, _, to_port_usage = iface_m.groups()
-            # from/to part types stay as declared in end_parts
         else:
-            # New-style: find the separate interface usage statement for this connection
+            # New-style: find the separate named interface usage statement
             iface_name = f"{conn_name}_Interface"
             iface_pat = (
                 rf'interface\s*:\s*{re.escape(iface_name)}'
@@ -982,7 +1043,6 @@ def _parse_component_exchanges(file_path: pathlib.Path) -> List[Dict]:
             to_path_parts   = iu_m.group(2).split('.')
             from_port_usage = from_path_parts[-1]
             to_port_usage   = to_path_parts[-1]
-            # The part usage is the second-to-last segment of the path
             from_uname = from_path_parts[-2] if len(from_path_parts) >= 2 else from_path_parts[0]
             to_uname   = to_path_parts[-2]   if len(to_path_parts)   >= 2 else to_path_parts[0]
             from_part_type = usage_to_type.get(from_uname, from_part_type)
@@ -1003,6 +1063,48 @@ def _parse_component_exchanges(file_path: pathlib.Path) -> List[Dict]:
             'to_part_name':        to_part_type,
             'to_port_id':          to_info.get('id', ''),
             'to_port_name':        to_port_usage,
+            'to_port_direction':   to_info.get('direction', ''),
+        })
+
+    # ── 2. Named interface usages (new-style component exchanges) ──────────────
+    # Pattern: interface <name> : <InterfaceDef> connect <from_usage>.<port> to <to_usage>.<port>;
+    # These appear inside part usage blocks or at the top level of the package.
+    # Each named interface usage is a distinct component exchange, even when multiple
+    # usages share the same interface def (the shared-interface-def case).
+    seen_iface_names: set = set()
+    for m in re.finditer(
+        r'interface\s+(\w+)\s*:\s*(\w+)\s+connect\s+(\w+)\.(\w+)\s+to\s+(\w+)\.(\w+)\s*;',
+        content,
+    ):
+        iface_usage_name = m.group(1)
+        iface_type       = m.group(2)   # interface def name (may be shared across exchanges)
+        from_usage       = m.group(3)
+        from_port        = m.group(4)
+        to_usage         = m.group(5)
+        to_port          = m.group(6)
+
+        if iface_usage_name in seen_iface_names:
+            continue
+        seen_iface_names.add(iface_usage_name)
+
+        from_part_type = usage_to_type.get(from_usage, '')
+        to_part_type   = usage_to_type.get(to_usage, '')
+
+        from_info = part_port_map.get(from_part_type, {}).get(from_port, {})
+        to_info   = part_port_map.get(to_part_type,   {}).get(to_port,   {})
+
+        connections.append({
+            'conn_id':             extract_id(f'interface:{iface_usage_name}:{iface_type}'),
+            'conn_name':           iface_usage_name,
+            'from_part_id':        from_info.get('part_id', part_def_ids.get(from_part_type, '')),
+            'from_part_name':      from_part_type,
+            'from_port_id':        from_info.get('id', ''),
+            'from_port_name':      from_port,
+            'from_port_direction': from_info.get('direction', ''),
+            'to_part_id':          to_info.get('part_id', part_def_ids.get(to_part_type, '')),
+            'to_part_name':        to_part_type,
+            'to_port_id':          to_info.get('id', ''),
+            'to_port_name':        to_port,
             'to_port_direction':   to_info.get('direction', ''),
         })
 
@@ -1055,248 +1157,65 @@ def export_component_exchanges(ws, parts_path: pathlib.Path) -> None:
 # Exchange Allocations export  (Parts + Functions -> "Link Exchanges" worksheet)
 # ============================================================================
 
-def _parse_parts_for_exchange_allocations(file_path: pathlib.Path):
-    """Parse a parts SysML file for exchange-allocation cross-referencing.
+def _parse_function_locations(file_path: pathlib.Path) -> Dict[str, List[str]]:
+    """Return {action_type_name: [part_type_names that perform it]}.
 
-    Supports both old-style (ports in def bodies, interface connect in connection def) and
-    new-style (bare defs, ports in usage blocks, interface connects as separate usages).
-
-    Returns (part_defs, ce_connections, interface_defs).
+    Scans both part/item def bodies and usage blocks for ``perform action``
+    statements so that both old-style and new-style SysML layouts are covered.
     """
     raw = file_path.read_text(encoding='utf-8')
     try:
         _, content = _get_package_content(raw, file_path)
-    except ValueError as exc:
-        raise ValueError(str(exc)) from exc
+    except ValueError:
+        return {}
 
-    # --- Part defs: collect IDs and ports ---
-    # Old-style: ports live inside def bodies
-    part_defs: Dict = {}
+    action_to_parts: Dict[str, List[str]] = {}
+
+    # Scan part/item def bodies (old-style and mixed-style)
     for m in re.finditer(r'(?:part|item) def (\w+)\s*\{', content):
-        name = m.group(1)
+        part_type = m.group(1)
         body, _ = get_block(content, m.end())
-        ports: Dict = {}
-        for pm in re.finditer(r'port (\w+)\s*:\s*\w+\s*\{', body):
-            port_name = pm.group(1)
-            port_body, _ = get_block(body, pm.end())
-            ports[port_name] = {'id': extract_id(port_body)}
-        part_defs[name] = {'id': extract_id(body), 'ports': ports}
+        for pm in re.finditer(r'\bperform action \w+\s*:\s*(\w+)', body):
+            action_type = pm.group(1)
+            lst = action_to_parts.setdefault(action_type, [])
+            if part_type not in lst:
+                lst.append(part_type)
 
-    # New-style: if no ports found in defs, scan usage blocks for port IDs
-    if not any(pd['ports'] for pd in part_defs.values()):
-        for m in re.finditer(r'(?:part|item)\s+\w+\s*:\s*(\w+)\s*\{', content):
-            type_name = m.group(1)
-            if type_name not in part_defs:
-                continue
-            body, _ = get_block(content, m.end())
-            for pm in re.finditer(r'port\s+(\w+)\s*:\s*\w+\s*\{', body):
-                port_name = pm.group(1)
-                port_body, _ = get_block(body, pm.end())
-                if port_name not in part_defs[type_name]['ports']:
-                    part_defs[type_name]['ports'][port_name] = {'id': extract_id(port_body)}
-
-    # Global usage-name → type-name map for resolving interface connect paths
-    usage_to_type = _build_usage_to_type_map(content)
-
-    # --- Connection defs ---
-    ce_connections: Dict = {}
-    for m in re.finditer(r'connection def (\w+)\s*\{', content):
-        ce_name = m.group(1)
+    # Scan usage blocks (new-style: bare defs, allocations in usage blocks)
+    for m in re.finditer(
+        r'(?:part|item)\s+(?:\[\d+\]\s+)?\w+\s*(?:\[\d+\])?\s*:\s*(\w+)\s*\{',
+        content,
+    ):
+        part_type = m.group(1)
         body, _ = get_block(content, m.end())
-        ce_id = extract_id(body)
-        end_parts = re.findall(r'end (?:part|item) (\w+)\s*:\s*(\w+);', body)
-        if len(end_parts) < 2:
-            continue
+        for pm in re.finditer(r'\bperform action \w+\s*:\s*(\w+)', body):
+            action_type = pm.group(1)
+            lst = action_to_parts.setdefault(action_type, [])
+            if part_type not in lst:
+                lst.append(part_type)
 
-        # Old-style: interface connect embedded in the connection def body
-        iface_m = re.search(
-            r'interface\s*:\s*\w+\s+connect\s+(\w+)\.(\w+)\s+to\s+(\w+)\.(\w+)', body
-        )
-        if iface_m:
-            from_part_usage, from_port_usage, to_part_usage, to_port_usage = iface_m.groups()
-            local_map = {u: t for u, t in end_parts}
-            ce_connections[ce_name] = {
-                'id':              ce_id,
-                'from_part_type':  local_map.get(from_part_usage, ''),
-                'to_part_type':    local_map.get(to_part_usage, ''),
-                'from_port_usage': from_port_usage,
-                'to_port_usage':   to_port_usage,
-            }
-        else:
-            # New-style: find the separate interface usage statement
-            iface_name = f"{ce_name}_Interface"
-            iface_pat = (
-                rf'interface\s*:\s*{re.escape(iface_name)}'
-                rf'\s+connect\s+(\S+?)\s+to\s+(\S+?)\s*;'
-            )
-            iu_m = re.search(iface_pat, content)
-            if not iu_m:
-                continue
-            from_path_parts = iu_m.group(1).split('.')
-            to_path_parts   = iu_m.group(2).split('.')
-            from_port_usage = from_path_parts[-1]
-            to_port_usage   = to_path_parts[-1]
-            from_uname = from_path_parts[-2] if len(from_path_parts) >= 2 else from_path_parts[0]
-            to_uname   = to_path_parts[-2]   if len(to_path_parts)   >= 2 else to_path_parts[0]
-            ce_connections[ce_name] = {
-                'id':              ce_id,
-                'from_part_type':  usage_to_type.get(from_uname, end_parts[0][1]),
-                'to_part_type':    usage_to_type.get(to_uname,   end_parts[1][1]),
-                'from_port_usage': from_port_usage,
-                'to_port_usage':   to_port_usage,
-            }
-
-    # --- Interface defs: collect flow-of items and allocation IDs ---
-    interface_defs: Dict = {}
-    _flow_re = re.compile(
-        r'flow\s+of\s+(\w+)\s+from\s+\w+\.\w+\s+to\s+\w+\.\w+\s*(?:;|\{([^}]*)\})',
-        re.DOTALL,
-    )
-    for m in re.finditer(r'interface def (\w+)\s*\{', content):
-        iface_name = m.group(1)
-        body, _ = get_block(content, m.end())
-        flows = []
-        for fm in _flow_re.finditer(body):
-            fe_type = fm.group(1)
-            block_content = fm.group(2) or ''
-            flows.append({'type': fe_type, 'allocation_id': extract_id(block_content)})
-        interface_defs[iface_name] = {'flows': flows}
-
-    return part_defs, ce_connections, interface_defs
-
-
-def _parse_functions_for_exchange_allocations(file_path: pathlib.Path):
-    """Parse a functions SysML file for exchange-allocation cross-referencing.
-
-    Returns (action_defs, item_defs, fe_conns_by_id).
-    """
-    raw = file_path.read_text(encoding='utf-8')
-    try:
-        _, content = _get_package_content(raw, file_path)
-    except ValueError as exc:
-        raise ValueError(str(exc)) from exc
-
-    action_defs: Dict = {}
-    for m in re.finditer(r'action def (\w+)\s*\{', content):
-        name = m.group(1)
-        body, _ = get_block(content, m.end())
-        ports: Dict = {}
-        for pm in re.finditer(r'port (\w+)\s*:\s*\w+\s*\{', body):
-            port_name = pm.group(1)
-            port_body, _ = get_block(body, pm.end())
-            ports[port_name] = {'id': extract_id(port_body)}
-        action_defs[name] = {'id': extract_id(body), 'ports': ports}
-
-    item_defs: Dict = {}
-    for m in re.finditer(r'item def (\w+)\s*\{', content):
-        name = m.group(1)
-        body, _ = get_block(content, m.end())
-        item_defs[name] = {'id': extract_id(body)}
-
-    fe_conns_by_id: Dict = {}
-    for m in re.finditer(r'connection def (\w+)\s*\{', content):
-        body, _ = get_block(content, m.end())
-        conn_id = extract_id(body)
-        if not conn_id:
-            continue
-        end_actions = re.findall(r'end action (\w+)\s*:\s*(\w+);', body)
-        if len(end_actions) < 2:
-            continue
-        iface_m = re.search(
-            r'interface\s*:\s*\w+\s+connect\s+(\w+)\.(\w+)\s+to\s+(\w+)\.(\w+)', body
-        )
-        if not iface_m:
-            continue
-        # FE connect order: TARGET.to_port to SOURCE.from_port
-        to_action_usage, to_port_usage, from_action_usage, from_port_usage = iface_m.groups()
-        usage_to_type = {u: t for u, t in end_actions}
-        fe_conns_by_id[conn_id] = {
-            'from_action_type': usage_to_type.get(from_action_usage, ''),
-            'to_action_type':   usage_to_type.get(to_action_usage,   ''),
-            'from_port_usage':  from_port_usage,
-            'to_port_usage':    to_port_usage,
-        }
-
-    return action_defs, item_defs, fe_conns_by_id
-
-
-def _build_exchange_allocation_rows(
-    part_defs, ce_connections, interface_defs,
-    action_defs, item_defs, fe_conns_by_id,
-) -> List[Dict]:
-    """Cross-reference parsed data and return one dict per exchange allocation row."""
-    rows: List[Dict] = []
-
-    for iface_name, iface in interface_defs.items():
-        if not iface['flows'] or not iface_name.endswith('_Interface'):
-            continue
-
-        ce_name = iface_name[:-len('_Interface')]
-        ce = ce_connections.get(ce_name)
-        if not ce:
-            continue
-
-        from_part = part_defs.get(ce['from_part_type'], {})
-        to_part   = part_defs.get(ce['to_part_type'],   {})
-
-        src_component_id   = from_part.get('id', '')
-        src_component_name = from_pascal_case(ce['from_part_type'])
-        src_port_id        = from_part.get('ports', {}).get(ce['from_port_usage'], {}).get('id', '')
-        src_port_name      = format_port_name(ce['from_port_usage'])
-
-        tgt_component_id   = to_part.get('id', '')
-        tgt_component_name = from_pascal_case(ce['to_part_type'])
-        tgt_port_id        = to_part.get('ports', {}).get(ce['to_port_usage'], {}).get('id', '')
-        tgt_port_name      = format_port_name(ce['to_port_usage'])
-
-        for flow in iface['flows']:
-            fe_type       = flow['type']
-            allocation_id = flow['allocation_id']
-            fe_id   = item_defs.get(fe_type, {}).get('id', '')
-            fe_name = from_pascal_case(fe_type)
-
-            fe_conn          = fe_conns_by_id.get(fe_id, {})
-            from_action_type = fe_conn.get('from_action_type', '')
-            to_action_type   = fe_conn.get('to_action_type',   '')
-            fe_from_port     = fe_conn.get('from_port_usage',  '')
-            fe_to_port       = fe_conn.get('to_port_usage',    '')
-
-            from_action = action_defs.get(from_action_type, {})
-            to_action   = action_defs.get(to_action_type,   {})
-
-            rows.append({
-                'ce_id':             ce['id'],
-                'ce_name':           format_exchange_name(ce_name),
-                'src_port_id':       src_port_id,
-                'src_port_name':     src_port_name,
-                'src_component_id':  src_component_id,
-                'src_component_name': src_component_name,
-                'tgt_port_id':       tgt_port_id,
-                'tgt_port_name':     tgt_port_name,
-                'tgt_component_id':  tgt_component_id,
-                'tgt_component_name': tgt_component_name,
-                'fe_id':             fe_id,
-                'fe_name':           fe_name,
-                'fe_src_port_id':    from_action.get('ports', {}).get(fe_from_port, {}).get('id', ''),
-                'fe_src_port_name':  format_port_name(fe_from_port) if fe_from_port else '',
-                'fe_tgt_port_id':    to_action.get('ports', {}).get(fe_to_port, {}).get('id', ''),
-                'fe_tgt_port_name':  format_port_name(fe_to_port) if fe_to_port else '',
-                'allocation_id':     allocation_id,
-                'src_func_id':       from_action.get('id', ''),
-                'tgt_func_id':       to_action.get('id', ''),
-            })
-
-    return rows
+    return action_to_parts
 
 
 def export_exchange_allocations(ws, parts_path: pathlib.Path, functions_path: pathlib.Path) -> None:
-    """Populate *ws* (Link Exchanges worksheet) from Parts + Functions SysML files."""
-    part_defs, ce_connections, interface_defs = _parse_parts_for_exchange_allocations(parts_path)
-    action_defs, item_defs, fe_conns_by_id   = _parse_functions_for_exchange_allocations(functions_path)
-    rows = _build_exchange_allocation_rows(
-        part_defs, ce_connections, interface_defs,
-        action_defs, item_defs, fe_conns_by_id,
-    )
+    """Populate *ws* (Link Exchanges worksheet) from Parts + Functions SysML files.
+
+    Matching strategy
+    -----------------
+    For each functional exchange (FE), the start and end action types are looked
+    up in the function-location map to find which component/part types perform
+    them.  A component exchange (CE) is then matched when its source component
+    type equals the FE's start-function location AND its target component type
+    equals the FE's end-function location.  Each (FE, CE) match produces one row.
+
+    Component exchanges are parsed with ``_parse_component_exchanges``, which
+    handles both old-style ``connection def`` blocks and new-style named interface
+    usage statements (``interface name : Type connect a.p to b.q;``).
+    """
+    # Use the same robust parsers as the individual export worksheets.
+    ce_list          = _parse_component_exchanges(parts_path)
+    fe_list          = _parse_functional_exchanges(functions_path)
+    action_to_parts  = _parse_function_locations(parts_path)
 
     headers = [
         "Component Exchange ID", "Component Exchange Name",
@@ -1314,30 +1233,41 @@ def export_exchange_allocations(ws, parts_path: pathlib.Path, functions_path: pa
         ws.cell(row=1, column=col, value=header)
     _apply_header_style(ws)
 
-    for row_data in rows:
-        r = ws.max_row + 1
-        ws.cell(r,  1, row_data['ce_id'])
-        ws.cell(r,  2, row_data['ce_name'])
-        ws.cell(r,  3, row_data['src_port_id'])
-        ws.cell(r,  4, row_data['src_port_name'])
-        ws.cell(r,  5, row_data['src_component_id'])
-        ws.cell(r,  6, row_data['src_component_name'])
-        ws.cell(r,  7, row_data['tgt_port_id'])
-        ws.cell(r,  8, row_data['tgt_port_name'])
-        ws.cell(r,  9, row_data['tgt_component_id'])
-        ws.cell(r, 10, row_data['tgt_component_name'])
-        ws.cell(r, 11, row_data['fe_id'])
-        ws.cell(r, 12, row_data['fe_name'])
-        ws.cell(r, 13, row_data['fe_src_port_id'])
-        ws.cell(r, 14, row_data['fe_src_port_name'])
-        ws.cell(r, 15, row_data['fe_tgt_port_id'])
-        ws.cell(r, 16, row_data['fe_tgt_port_name'])
-        ws.cell(r, 17, row_data['allocation_id'])
-        ws.cell(r, 18, row_data['src_func_id'])
-        ws.cell(r, 19, row_data['tgt_func_id'])
+    row_count = 0
+    for fe in fe_list:
+        from_parts = set(action_to_parts.get(fe['from_action_name'], []))
+        to_parts   = set(action_to_parts.get(fe['to_action_name'],   []))
+
+        for ce in ce_list:
+            if ce['from_part_name'] not in from_parts:
+                continue
+            if ce['to_part_name'] not in to_parts:
+                continue
+            # Match: FE is allocated to this CE
+            r = ws.max_row + 1
+            ws.cell(r,  1, ce['conn_id'])
+            ws.cell(r,  2, format_exchange_name(ce['conn_name']))
+            ws.cell(r,  3, ce['from_port_id'])
+            ws.cell(r,  4, format_port_name(ce['from_port_name']))
+            ws.cell(r,  5, ce['from_part_id'])
+            ws.cell(r,  6, from_pascal_case(ce['from_part_name']))
+            ws.cell(r,  7, ce['to_port_id'])
+            ws.cell(r,  8, format_port_name(ce['to_port_name']))
+            ws.cell(r,  9, ce['to_part_id'])
+            ws.cell(r, 10, from_pascal_case(ce['to_part_name']))
+            ws.cell(r, 11, fe['exchange_id'])
+            ws.cell(r, 12, from_pascal_case(fe['exchange_name']))
+            ws.cell(r, 13, fe['from_port_id'])
+            ws.cell(r, 14, format_port_name(fe['from_port_name']))
+            ws.cell(r, 15, fe['to_port_id'])
+            ws.cell(r, 16, format_port_name(fe['to_port_name']))
+            ws.cell(r, 17, '')  # Allocation ID — not stored in SysML
+            ws.cell(r, 18, fe['from_action_id'])
+            ws.cell(r, 19, fe['to_action_id'])
+            row_count += 1
 
     _auto_adjust_columns(ws)
-    print(f"  -> {len(rows)} exchange allocations exported.")
+    print(f"  -> {row_count} exchange allocations exported.")
 
 
 # ============================================================================
