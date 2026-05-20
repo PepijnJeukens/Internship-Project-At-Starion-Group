@@ -2508,3 +2508,4 @@ def full_import(
         import_functional_chains(rows, functions_path)
 
     print("\nDone.")
+
