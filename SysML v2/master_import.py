@@ -21,12 +21,14 @@ from import_functions import full_import
 #             / data / to be imported excel files
 # ---------------------------------------------------------------------------
 
-_FOLDER_DIR = pathlib.Path(__file__).parent.parent
+_FOLDER_DIR = pathlib.Path(__file__).parent#.parent
 
 # Path to the Excel workbook that contains all data sheets.
 # Expected worksheets (others are ignored):
 #   Systems | Functions | Link Systems and Functions | Functional Exchanges |
 #   Component Exchanges | Link Exchanges | Functional Chains
+print(_FOLDER_DIR)
+
 EXCEL_FILE_PATH = _FOLDER_DIR / "data" / "DVS_complete_export.xlsx"
 
 # Output SysML filenames (written into the DVS/ directory).
