@@ -167,14 +167,40 @@ def _find_block_end(content: str, open_brace_pos: int) -> int:
     return -1
 
 
-def validate(path: pathlib.Path, check_dir: bool = False) -> bool:
-    """Run syside check on path (or its parent directory when check_dir=True)."""
-    target = str(path.parent if check_dir else path)
+def _find_syside_stdlib() -> Optional[str]:
+    """Return path to the syside standard library, or None if not found."""
     try:
-        proc = subprocess.run(
-            ["syside", "check", target],
-            capture_output=True, text=True,
-        )
+        import syside as _syside_pkg
+        candidate = pathlib.Path(_syside_pkg.__file__).parent / "sysml.library"
+        if candidate.is_dir():
+            return str(candidate)
+    except ImportError:
+        pass
+    # Fallback: check _syside (bundled variant used by some installs)
+    try:
+        import _syside as _syside_pkg  # type: ignore[import]
+        candidate = pathlib.Path(_syside_pkg.__file__).parent / "sysml.library"
+        if candidate.is_dir():
+            return str(candidate)
+    except ImportError:
+        pass
+    return None
+
+
+def validate(path: pathlib.Path, check_dir: bool = False) -> bool:
+    """Run syside check on path (or its parent directory when check_dir=True).
+
+    Includes the SysML standard library so that implicit-supertype errors
+    (PartDefinition.base, ItemDefinition.base, etc.) are resolved.
+    Uses --diagnose project so only project-file errors are reported.
+    """
+    target = str(path.parent if check_dir else path)
+    stdlib = _find_syside_stdlib()
+    cmd = ["syside", "check", "--diagnose", "project", target]
+    if stdlib:
+        cmd += ["--std", stdlib]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True)
         output = proc.stdout + proc.stderr
         if proc.returncode != 0 or "error" in output.lower():
             print("Validation errors:")
@@ -1690,6 +1716,7 @@ def inject_component_exchanges(sysml_text: str, exchanges: List[ComponentExchang
             continue
         emitted_iface_usages.add(iface_key)
 
+        conn_usage_name = exch_name[0].lower() + exch_name[1:]
         container = get_container(from_part_name, to_part_name)
         if container:
             # Internal: endpoint refs relative to container
@@ -1699,13 +1726,13 @@ def inject_component_exchanges(sysml_text: str, exchanges: List[ComponentExchang
             from_ref = from_port if from_part_name == container else f"{from_uname}.{from_port}"
             to_ref = to_port if to_part_name == container else f"{to_uname}.{to_port}"
             # Store bare (no leading indent) — indentation applied at insertion time
-            stmt = f"interface : {iface_name} connect {from_ref} to {to_ref};"
+            stmt = f"interface {conn_usage_name} : {iface_name} connect {from_ref} to {to_ref};"
             internal_conns.setdefault(container, []).append(stmt)
         else:
             # External: package-level interface usage with fully-qualified paths
             from_qual = _qual_usage(from_part_name)
             to_qual = _qual_usage(to_part_name)
-            stmt = f"{INDENT}interface : {iface_name} connect {from_qual}.{from_port} to {to_qual}.{to_port};"
+            stmt = f"{INDENT}interface {conn_usage_name} : {iface_name} connect {from_qual}.{from_port} to {to_qual}.{to_port};"
             external_conns.append(stmt)
 
     # Insert internal connections inside container usage block
@@ -2508,4 +2535,3 @@ def full_import(
         import_functional_chains(rows, functions_path)
 
     print("\nDone.")
-
