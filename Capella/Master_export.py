@@ -1,7 +1,7 @@
 '''
-Created on 08 Apr 2026
-
-@author: p.jeukens
+This script will export the full logical architecture layer of your Capella model to Excel.
+For it to work you only have to specify the aird path of your Capella model that you with to export.
+An Excel file in a results folder will be created automatically for you in your Capella directory that contains all information. 
 '''
 # include needed for the Capella modeller API
 include('workspace://Python4Capella/simplified_api/capella.py')

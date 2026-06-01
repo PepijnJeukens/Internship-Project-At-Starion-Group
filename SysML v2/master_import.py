@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """
 master_import.py
-Run the full sysml v2 import pipeline from a single multi-sheet Excel workbook.
+Run the full SysML v2 import pipeline from a single multi-sheet Excel workbook.
 
 Customize the variables in the USER CONFIGURATION section below, then run:
   python master_import.py
+
+The variables that have to be customised are the excel file path, the parts and functions file names and packages. 
+The excel file path contains the excel to be imported, the parts and functions filenames are what you want your filenames to be. 
+The package names of both the parts and functions are optional to fill in to give specific names, if not specified it will be derived from the file path names.
 """
 
 import pathlib
